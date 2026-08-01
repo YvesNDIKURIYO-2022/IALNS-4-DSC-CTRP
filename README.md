@@ -6,9 +6,6 @@ for the **Dynamic Stability-Constrained Container-Tanker Routing Problem**
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
 [![Python 3.8+](https://img.shields.io/badge/python-3.8+-blue.svg)](https://www.python.org/)
 [![CPLEX](https://img.shields.io/badge/CPLEX-22.1.0-red.svg)](https://www.ibm.com/analytics/cplex-optimizer)
-[![DOI](https://zenodo.org/badge/DOI/10.5281/zenodo.XXXXXX.svg)](https://doi.org/10.5281/zenodo.XXXXXX)
-[![arXiv](https://img.shields.io/badge/arXiv-XXXX.XXXXX-b31b1b.svg)](https://arxiv.org/abs/XXXX.XXXXX)
-
 ---
 
 ## 📖 Overview
