@@ -1,6 +1,6 @@
-# IALNS-ESV for DSC-CTRP
+# IALNS for DSC-CTRP
 
-**Improved Adaptive Large Neighborhood Search with Embedded Stability Verification**  
+**Improved Adaptive Large Neighborhood Search**  
 for the **Dynamic Stability-Constrained Container-Tanker Routing Problem**
 
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
@@ -13,7 +13,7 @@ for the **Dynamic Stability-Constrained Container-Tanker Routing Problem**
 
 Liquid bulk transportation via multi-compartment tankers presents a critical operational challenge: balancing economic efficiency with physical safety throughout dynamic delivery routes. Existing vehicle routing models either ignore loading constraints entirely or treat them as static post-optimization checks, leading to solutions that are economically optimal but operationally infeasible or unsafe.
 
-This repository provides the complete implementation of the **Improved Adaptive Large Neighborhood Search with Embedded Stability Verification (IALNS-ESV)** algorithm for solving the **Dynamic Stability-Constrained Container-Tanker Routing Problem (DSC-CTRP)**.
+This repository provides the complete implementation of the **Improved Adaptive Large Neighborhood Search (IALNS)** algorithm for solving the **Dynamic Stability-Constrained Container-Tanker Routing Problem (DSC-CTRP)**.
 
 ### Key Contributions
 
@@ -35,7 +35,7 @@ This repository provides the complete implementation of the **Improved Adaptive 
 
 | Algorithm | Avg Cost ($) | Std Cost | LDD Violation (%) | CG Compliance (%) | CPU (s) |
 |-----------|--------------|----------|-------------------|-------------------|---------|
-| **IALNS-ESV** | **419.99** | 115.94 | **0.00** | **100.00** | 0.011 |
+| **IALNS** | **419.99** | 115.94 | **0.00** | **100.00** | 0.011 |
 | Standard ALNS | 395.48 | 85.55 | 0.00 | 91.70 | 0.003 |
 | FDAHS | 2,127.91 | 1,425.42 | 0.00 | 91.70 | 0.006 |
 | GCOF | 2,127.91 | 1,425.42 | 0.00 | 91.70 | 0.082 |
@@ -88,14 +88,14 @@ joblib>=1.1.0
 ## 🚀 Quick Start
 
 ```python
-from src.alns import IALNS_ESV
+from src.alns import IALNS
 from src.benchmarks import load_instance
 
 # Load a benchmark instance
 instance = load_instance("EL_1")
 
 # Create solver
-solver = IALNS_ESV(instance)
+solver = IALNS(instance)
 
 # Solve
 solution = solver.solve()
@@ -171,7 +171,7 @@ All instances are stored in standardized JSON format and are publicly available.
 
 ## 🧠 Algorithm Architecture
 
-The IALNS-ESV framework follows a master-slave architectural pattern:
+The IALNS framework follows a master-slave architectural pattern:
 
 ```
 ┌─────────────────────────────────────────────────────────────────┐
@@ -221,7 +221,7 @@ The IALNS-ESV framework follows a master-slave architectural pattern:
 |------|-------------|-------------------|
 | **1** | Geometric & Capacity | Routing flow, compartment capacity, product compatibility |
 | **2** | Static LDD Stability | Axle load bounds (Eqs. 11–15), center-of-gravity limits |
-| **3** | Dynamic Sloshing | Fill ratio avoidance [0.35, 0.55] (Eqs. 16–17) + physical validation |
+| **3** | Dynamic Anti-Sloshing | Fill ratio avoidance [0.35, 0.55] (Eqs. 16–17) + physical validation |
 
 ---
 
