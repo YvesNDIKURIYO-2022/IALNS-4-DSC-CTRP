@@ -1,6 +1,7 @@
-# IALNS for DSC-CTRP
 
-**Improved Adaptive Large Neighborhood Search**  
+# SA-ALNS for DSC-CTRP
+
+**Stability-Aware Adaptive Large Neighborhood Search**
 for the **Dynamic Stability-Constrained Container-Tanker Routing Problem**
 
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
@@ -13,36 +14,38 @@ for the **Dynamic Stability-Constrained Container-Tanker Routing Problem**
 
 Liquid bulk transportation via multi-compartment tankers presents a critical operational challenge: balancing economic efficiency with physical safety throughout dynamic delivery routes. Existing vehicle routing models either ignore loading constraints entirely or treat them as static post-optimization checks, leading to solutions that are economically optimal but operationally infeasible or unsafe.
 
-This repository provides the complete implementation of the **Improved Adaptive Large Neighborhood Search (IALNS)** algorithm for solving the **Dynamic Stability-Constrained Container-Tanker Routing Problem (DSC-CTRP)**.
+This repository provides the complete implementation of the **Stability-Aware Adaptive Large Neighborhood Search (SA-ALNS)** for solving the **Dynamic Stability-Constrained Container-Tanker Routing Problem (DSC-CTRP)**.
 
 ### Key Contributions
 
 | Contribution | Description |
 |--------------|-------------|
-| **Novel Problem Formulation** | DSC-CTRP integrating routing decisions with dynamic stability constraints |
-| **MILP Model** | Three-tier constraint hierarchy (geometric, static LDD, dynamic anti-sloshing) |
-| **IALNS Algorithm** | Master-slave metaheuristic with embedded stability verification |
-| **Novel Operators** | Imbalance Removal (destroy) and Stability-Aware Insertion (repair) |
-| **Two-Stage Verification** | Capacity screening + exact MILP or SACA heuristic verification |
-| **Feasibility Cache** | 88.26% hit rate, eliminating 87.2% of MILP calls |
-| **Benchmark Suite** | 281 instances across 2 established MCVRP suites (3-100 customers) |
+| **Unified Formulation** | DSC-CTRP integrating routing decisions with dynamic stability constraints at every delivery prefix |
+| **Three-Tier Constraint Hierarchy** | Geometric/capacity, static LDD, and dynamic anti-sloshing constraints in one MILP |
+| **SA-ALNS Algorithm** | Master–slave metaheuristic with embedded stability verification |
+| **Sequence-Aware Cache** | Feasibility cache keyed on the ordered visit sequence (not the customer set) |
+| **Benchmark Suite** | 100 instances; 30 used for the SOTA comparison and ablation reported in the manuscript |
+| **Open Null Result** | Adaptive operator selection and stability-aware repair show no measurable effect on this benchmark |
 
 ---
 
 ## 📊 Experimental Results
 
-### Comprehensive State-of-the-Art Performance (281 Instances)
+### State-of-the-Art Comparison (30 Instances, 20–25 Customers)
 
-| Algorithm | Avg Cost ($) | Std Cost | LDD Violation (%) | CG Compliance (%) | CPU (s) |
-|-----------|--------------|----------|-------------------|-------------------|---------|
-| **IALNS** | **419.99** | 115.94 | **0.00** | **100.00** | 0.011 |
-| Standard ALNS | 395.48 | 85.55 | 0.00 | 91.70 | 0.003 |
-| FDAHS | 2,127.91 | 1,425.42 | 0.00 | 91.70 | 0.006 |
-| GCOF | 2,127.91 | 1,425.42 | 0.00 | 91.70 | 0.082 |
-| HSA | 2,127.91 | 1,425.42 | 0.00 | 91.70 | 0.002 |
-| ACO-2opt | 2,127.91 | 1,425.42 | 0.00 | 91.70 | 0.302 |
+| Algorithm | Avg Penalised Cost ($) | Fleet | LDD Violation (%) | CG Compliance (%) | Wall-clock (s) |
+|-----------|------------------------|-------|-------------------|-------------------|----------------|
+| **SA-ALNS** | 1430.32 | 4.30 | 35.17 | 100.00 | 0.43 |
+| SA-ALNS Cost-Only | 1435.02 | 4.33 | 36.00 | 100.00 | 0.38 |
+| Standard ALNS | 1416.51 | 4.30 | 30.83 | 100.00 | 0.51 |
+| FDAHS | 1550.84 | 4.20 | 22.61 | 100.00 | 1.54 |
+| GCOF | 1777.46 | 4.37 | 37.89 | 100.00 | 0.22 |
+| HSA | 1620.27 | 4.37 | 32.94 | 100.00 | 0.01 |
+| ACO-2opt | 1516.81 | 4.17 | 22.33 | 100.00 | 1.06 |
 
-> **Key Results:** IALNS achieves **100% CG compliance** (8.3% above Standard ALNS), **0% LDD violations**, and **100% stability margins**. The feasibility cache achieves **88.26% hit rate**, eliminating **87.2% of MILP calls** with near-linear runtime scaling (0.008–0.014 s for up to 20 customers).
+> **Key Results (from the manuscript).** SA-ALNS attains **5.70–19.53% lower penalised cost** than the four traditional metaheuristics (FDAHS, GCOF, HSA, ACO-2opt), with large effect sizes against GCOF (*p* = 1.9×10⁻⁹, Cohen's *d* = −0.844) and HSA (*p* = 9.3×10⁻⁹, *d* = −0.690). SA-ALNS is **statistically comparable to Standard ALNS** on cost (*p* = 0.152) but returns routes with lower residual penalty. Relative to a single-product-per-route baseline, the multi-compartment configuration reduces cost by **27.44%** and fleet size by **23.68%**. Integrated routing and loading outperforms sequential decomposition by **37.7%**. All solutions achieve **100% centre-of-gravity compliance**; residual LDD violations of **35.17%** are penalised and bounded along the delivery sequence.
+
+> **Implementation note.** The LP fallback in SACA is retained for completeness but is **never invoked** on this benchmark: the greedy split-allocation procedure succeeds on every feasible route, so MILP diagnostics are uniformly zero and wall-clock time is dominated by routing search. We disclose this explicitly rather than presenting the LP as a functional component.
 
 ---
 
@@ -51,15 +54,15 @@ This repository provides the complete implementation of the **Improved Adaptive 
 ### Prerequisites
 
 - Python 3.10 or higher
-- IBM ILOG CPLEX 22.1.0 or higher
+- IBM ILOG CPLEX 22.1.0 or higher (optional — used only by the SACA-MILP fallback, which is not exercised on the reported benchmark)
 - MiKTeX or TeX Live (for manuscript compilation)
 
 ### Setup
 
 ```bash
 # Clone the repository
-git clone https://github.com/YvesNDIKURIYO-2022/IALNS-4-DSC-CTRP.git
-cd IALNS-4-DSC-CTRP
+git clone https://github.com/YvesNDIKURIYO-2022/SA-ALNS-4-DSC-CTRP.git
+cd SA-ALNS-4-DSC-CTRP
 
 # Create virtual environment
 python -m venv venv
@@ -88,14 +91,14 @@ joblib>=1.1.0
 ## 🚀 Quick Start
 
 ```python
-from src.alns import IALNS
+from src.alns import SAALNS
 from src.benchmarks import load_instance
 
 # Load a benchmark instance
 instance = load_instance("EL_1")
 
 # Create solver
-solver = IALNS(instance)
+solver = SAALNS(instance)
 
 # Solve
 solution = solver.solve()
@@ -108,12 +111,14 @@ print(f"Stability Margin: {solution.stability_margin:.2f}%")
 print(f"CPU Time: {solution.cpu_time:.3f}s")
 ```
 
+If you import from an older script, a backward-compatibility alias is provided: `from src.alns import IALNS` still resolves to `SAALNS`.
+
 ---
 
 ## 📁 Repository Structure
 
 ```
-IALNS-4-DSC-CTRP/
+SA-ALNS-4-DSC-CTRP/
 ├── README.md                    # This file
 ├── LICENSE                      # MIT License
 ├── requirements.txt             # Python dependencies
@@ -130,21 +135,22 @@ IALNS-4-DSC-CTRP/
 │   │   ├── saca_heuristic.py    # Heuristic solver (|R_k| > 9)
 │   │   └── ldd_verification.py  # LDD constraint checker
 │   ├── cache/                   # Feasibility Cache
-│   │   └── feasibility_cache.py # LRU cache with route-invariant keys
+│   │   └── feasibility_cache.py # LRU cache with sequence-aware keys
 │   └── utils/                   # Utilities
 │       ├── instance_loader.py   # JSON instance loader
 │       └── metrics.py           # Performance metrics
 │
-├── benchmarks/                  # Benchmark instances (281 total)
-│   ├── paixao/                  # 40 instances (3-9 customers, 3 commodities)
-│   │   ├── S_1--S_10            # 3 customers
-│   │   ├── M_1--M_10            # 5 customers
-│   │   ├── L_1--L_10            # 7 customers
-│   │   └── EL_1--EL_10          # 9 customers
-│   └── mirzaei_muyldermans/     # 241 instances (10-100 customers, 2-6 commodities)
+├── benchmarks/                  # Benchmark instances
+│   ├── paixao/                  # 15 instances (20–30 customers, 3 commodities)
+│   │   ├── P20_1--P20_5         # 20 customers
+│   │   ├── P25_1--P25_5         # 25 customers
+│   │   └── P30_1--P30_5         # 30 customers
+│   └── mirzaei/                 # 85 instances (20–100 customers, 2–6 commodities)
+│       ├── vrpnc1--vrpnc15      # Mirzaei-layer instances
+│       └── extra33--extra87     # Extended instances
 │
 ├── manuscript/                  # LaTeX manuscript
-│   ├── Manuscript-IALNS.tex
+│   ├── Manuscript-SA-ALNS.tex
 │   ├── references.bib
 │   └── figures/                 # All figures (PNG, PDF)
 │
@@ -157,21 +163,21 @@ IALNS-4-DSC-CTRP/
 
 ## 📚 Benchmark Instances
 
-The computational study evaluates **281 benchmark instances** from two established MCVRP suites:
+The study evaluates **100 synthetic benchmark instances** spanning 20–100 customers, 3–5 compartments, and 3–6 products. Of these, **30 instances** (20–25 customers) are used for the state-of-the-art comparison and the ablation study reported in the manuscript; the remaining 70 are reserved for a scalability study to be reported in follow-up work.
 
-| Suite | Instances | Customers | Commodities | Purpose |
-|-------|-----------|-----------|-------------|---------|
-| Paixão et al. (2026) | 40 | 3–9 | 3 | LDD & stability validation |
-| Mirzaei & Wøhlk (2019) + Muyldermans & Pang (2010) | 241 | 10–100 | 2–6 | Scalability testing |
-| **Total** | **281** | **3–100** | **2–6** | **Full evaluation** |
+| Layer | Instances | Customers | Products | Purpose |
+|-------|-----------|-----------|----------|---------|
+| Paixão layer | 15 | 20–30 | 3 | LDD & stability validation |
+| Mirzaei layer | 85 | 20–100 | 2–6 | Scalability testing |
+| **Total** | **100** | **20–100** | **2–6** | **Full evaluation** |
 
-All instances are stored in standardized JSON format and are publicly available.
+All instances are stored in standardized JSON format and are publicly available. Each customer demands exactly one product, with demand magnitudes calibrated to 60–90% of the average compartment volume.
 
 ---
 
 ## 🧠 Algorithm Architecture
 
-The IALNS framework follows a master-slave architectural pattern:
+The SA-ALNS framework follows a master–slave architectural pattern:
 
 ```
 ┌─────────────────────────────────────────────────────────────────┐
@@ -182,34 +188,36 @@ The IALNS framework follows a master-slave architectural pattern:
 ┌─────────────────────────────────────────────────────────────────┐
 │              Master Module: ALNS Routing Search                 │
 │  ┌────────────────────────┐   ┌──────────────────────────────┐ │
-│  │   Destroy Operators     │   │    Repair Operators          │ │
-│  │  • Random               │ → │  • Greedy                   │ │
-│  │  • Worst-Cost           │   │  • Regret-k                 │ │
-│  │  • Compatibility        │   │  • Stability-Aware          │ │
-│  │  • Imbalance            │   │    Insertion                │ │
+│  │   Destroy Operators    │   │    Repair Operators          │ │
+│  │  • Random              │ → │  • Greedy                    │ │
+│  │  • Worst-Cost          │   │  • Regret-k                  │ │
+│  │  • Compatibility       │   │  • Stability-Aware Insertion │ │
+│  │  • Imbalance           │   │  • Balance                   │ │
+│  │  • Shaw                │   │                              │ │
 │  └────────────────────────┘   └──────────────────────────────┘ │
 └─────────────────────────────────────────────────────────────────┘
                               ▼
 ┌─────────────────────────────────────────────────────────────────┐
-│                   Feasibility Cache Check                       │
-│              YES ────────────────────────┐                     │
-│               NO                         │                     │
-│               ▼                          ▼                     │
-│  ┌───────────────────────────┐ ┌────────────────────────────┐  │
-│  │  Slave Module: SACA       │ │  Update Best Solution       │  │
-│  │  Two-Stage Verification   │ │                            │  │
-│  │  Stage 1: Capacity        │ └────────────────────────────┘  │
-│  │  & Volume Screening       │                                │
-│  │  Stage 2: SACA-MILP       │                                │
-│  │  (|R_k| ≤ 9) or           │                                │
-│  │  h-SACA (|R_k| > 9)       │                                │
-│  └───────────────────────────┘                                │
+│           Sequence-Aware Feasibility Cache Check                │
+│        (key = ordered customer tuple, not the set)              │
+│              YES ────────────────────────┐                      │
+│               NO                         │                      │
+│               ▼                          ▼                      │
+│  ┌───────────────────────────┐ ┌────────────────────────────┐   │
+│  │  Slave Module: SACA       │ │  Update Best Solution      │   │
+│  │  Two-Stage Verification   │ │                            │   │
+│  │  Stage 1: Capacity        │ └────────────────────────────┘   │
+│  │  & Volume Screening       │                                  │
+│  │  Stage 2: Greedy Split-   │                                  │
+│  │  Allocation (LP fallback  │                                  │
+│  │  retained, not invoked)   │                                  │
+│  └───────────────────────────┘                                  │
 └─────────────────────────────────────────────────────────────────┘
                               ▼
           ┌─────────────────────────────────────┐
-          │       Termination Criterion?         │
-          │    YES → Output Final Route Scheme   │
-          │    NO → Return to ALNS Main Loop     │
+          │       Termination Criterion?        │
+          │    YES → Output Final Route Scheme  │
+          │    NO → Return to ALNS Main Loop    │
           └─────────────────────────────────────┘
 ```
 
@@ -220,8 +228,8 @@ The IALNS framework follows a master-slave architectural pattern:
 | Tier | Constraints | Verification Type |
 |------|-------------|-------------------|
 | **1** | Geometric & Capacity | Routing flow, compartment capacity, product compatibility |
-| **2** | Static LDD Stability | Axle load bounds (Eqs. 11–15), center-of-gravity limits |
-| **3** | Dynamic Anti-Sloshing | Fill ratio avoidance [0.35, 0.55] (Eqs. 16–17) + physical validation |
+| **2** | Static LDD Stability | Axle load bounds, centre-of-gravity limits |
+| **3** | Dynamic Anti-Sloshing | Fill-ratio avoidance [0.35, 0.55] + physical validation |
 
 ---
 
@@ -231,7 +239,9 @@ The IALNS framework follows a master-slave architectural pattern:
 |----------|---------|
 | **Economic Efficiency** | Total Distance, Transportation Cost, Fleet Utilization, Volume Utilization |
 | **Safety Compliance** | LDD Violation Rate, CG Compliance Rate, Stability Margin, Slosh Risk Score |
-| **Computational Performance** | CPU Time, Cache Hit Rate, MILP Calls, Iterations to Convergence |
+| **Computational Performance** | CPU Time, Route-Penalty Cache Hit Rate, Iterations to Convergence |
+
+A *verified route* is one that passes the sequence-aware feasibility check: cumulative volume at every delivery prefix ≤ vehicle capacity, and product count ≤ compartment count.
 
 ---
 
@@ -241,14 +251,17 @@ If you use this code, data, or benchmarks in your research, please cite:
 
 ```bibtex
 @article{Ndikuriyo2026,
-  title={An Improved Adaptive Large Neighborhood Search for Multi-Compartment 
-         Container-Tanker Routing with Dynamic Stability Constraints},
-  author={Ndikuriyo, Yves and Zhang, Yinggui},
-  journal={European Journal of Operational Research},
-  year={2026},
-  note={Under Review}
+  title   = {A Stability-Aware Adaptive Large Neighborhood Search for
+             Multi-Compartment Container-Tanker Routing with Dynamic
+             Stability Constraints},
+  author  = {Ndikuriyo, Yves and Zhang, Yinggui},
+  journal = {Computers \& Operations Research},
+  year    = {2026},
+  note    = {Under review}
 }
 ```
+
+The repository was previously published under the identifier `IALNS-4-DSC-CTRP` and has been renamed to `SA-ALNS-4-DSC-CTRP` for consistency with the manuscript. GitHub redirects the previous URL to the current one.
 
 ---
 
@@ -259,9 +272,9 @@ If you use this code, data, or benchmarks in your research, please cite:
 | Yves Ndikuriyo | First Author | yvesndikuriyo@csu.edu.cn |
 | Yinggui Zhang | Corresponding Author | ygzhang@csu.edu.cn |
 
-**Affiliation:**  
-School of Traffic and Transportation Engineering  
-Central South University  
+**Affiliation:**
+School of Traffic and Transportation Engineering
+Central South University
 Changsha, Hunan 410075, China
 
 ---
@@ -277,7 +290,7 @@ This work was supported by:
 
 ## 📄 License
 
-This project is licensed under the MIT License - see the [LICENSE](LICENSE) file for details.
+This project is licensed under the MIT License — see the [LICENSE](LICENSE) file for details.
 
 ---
 
@@ -288,4 +301,3 @@ Contributions are welcome! Please submit issues and pull requests through the Gi
 ---
 
 **⭐ Star this repository if you find it useful!**
-```
