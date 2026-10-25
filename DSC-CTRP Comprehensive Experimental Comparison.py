@@ -1,181 +1,175 @@
 """
-DSC-CTRP COMPREHENSIVE EXPERIMENTAL COMPARISON 
-================================================================================
+DSC-CTRP v8.9.1 — SA-ALNS + deterministic seed + cache-hit reporting
+=====================================================================
 
-Algorithms compared:
-1. IALNS (Proposed) - Full version with adaptive weights and enhanced operators
-2. Standard ALNS - Baseline ALNS without adaptive selection
-3. FDAHS - Feasibility-Driven Anytime Hybrid Search (Vu et al., 2026)
-4. GCOF - Guided Collaborative Optimization Framework (Han et al., 2026)
-5. HSA - Hybrid Simulated Annealing (Beneich & Douiri, 2023)
-6. ACO-2opt - Ant Colony Optimization with 2-Opt (Abdulkader et al., 2015)
+This script reproduces the experiments reported in:
 
-Performance Metrics Categories:
-- Economic Efficiency: Total Distance, Transportation Cost, Fleet Size, Fleet Utilization, Volume Utilization
-- Safety Compliance: LDD Violation Rate, Stability Margin, Minimum Load Ratio, Slosh Risk Score, CG Compliance
-- Computational Performance: CPU Time, SACA Calls, Cache Hit Rate, Iterations to Convergence
+    Ndikuriyo, Y., & Zhang, Y. (2026). A Stability-Aware Adaptive Large
+    Neighborhood Search for Multi-Compartment Container-Tanker Routing with
+    Dynamic Stability Constraints. Computers & Operations Research
+    (under review).
+
+It runs the state-of-the-art comparison, the ablation study, the
+penalty-coefficient sensitivity sweep, the multi-compartment comparison, the
+statistical tests, and the figures.
+
+Reproducibility
+---------------
+All random seeds are derived from _stable_seed(), which uses SHA-1 on a
+canonical string encoding rather than Python's built-in hash(). The built-in
+hash() on strings is randomised per process (PYTHONHASHSEED), so results were
+not reproducible across launches before v8.9.1. The current seed is stable
+across processes, machines, and Python versions; the only source of variation
+between runs is wall-clock time.
+
+Cache accounting
+----------------
+PerformanceMetrics reports two distinct cache hit rates:
+
+  * route_penalty_cache_hit_rate -- hit rate of BaseAlgorithm._route_penalty,
+    the cache that the No Cache ablation variant exercises. This is the
+    figure to quote in the manuscript.
+  * cache_hit_rate -- SACA-level hit rate. Because SACA's LP fallback is never
+    called on this benchmark, saca.milp_calls = 0 and this ratio saturates at
+    100% for any run with at least one SACA hit. It is retained for backward
+    compatibility but overstates the cache's contribution.
 
 Author: Yves Ndikuriyo
 Affiliation: Central South University
 """
 
+import argparse
+import copy
+import hashlib
 import json
-import os
-import time
-import random
 import math
-import numpy as np
-from typing import Dict, List, Tuple, Optional, Set
+import os
+import random
+import time
+import warnings
 from collections import defaultdict
 from dataclasses import dataclass, field
-import matplotlib.pyplot as plt
-import matplotlib
-import pandas as pd
-from scipy import stats
-from scipy.stats import mannwhitneyu, wilcoxon
-import warnings
-warnings.filterwarnings('ignore')
+from typing import Dict, List, Optional
 
-# ============================================================================
-# PATHS - FIXED FOR INTERACTIVE ENVIRONMENTS
-# ============================================================================
+import matplotlib
+matplotlib.use("Agg")
+import matplotlib.pyplot as plt
+import numpy as np
+import pandas as pd
+from scipy.stats import mannwhitneyu, wilcoxon
+
+warnings.filterwarnings("ignore")
 
 try:
-    try:
-        CURRENT_DIR = os.path.dirname(os.path.abspath(__file__))
-    except NameError:
-        try:
-            from IPython import get_ipython
-            if get_ipython() is not None:
-                CURRENT_DIR = os.getcwd()
-            else:
-                CURRENT_DIR = os.getcwd()
-        except:
-            CURRENT_DIR = os.getcwd()
-except:
-    CURRENT_DIR = os.getcwd()
+    import pulp
+except ImportError as exc:
+    raise ImportError("Install PuLP: pip install pulp") from exc
 
-POSSIBLE_PATHS = [
-    os.path.join(CURRENT_DIR, "benchmark_instances"),
-    r".\benchmark_instances",
-    r"../benchmark_instances",
-    r"benchmark_instances"
-]
-
-BASE_DIR = None
-for path in POSSIBLE_PATHS:
-    if os.path.exists(path):
-        BASE_DIR = path
-        break
-
-if BASE_DIR is None:
-    BASE_DIR = os.path.join(CURRENT_DIR, 'benchmark_instances')
-    os.makedirs(BASE_DIR, exist_ok=True)
-    print(f"Created benchmark directory at: {BASE_DIR}")
-
-OUTPUT_DIR = os.path.join(BASE_DIR, 'experimental_results', 'figures')
-os.makedirs(OUTPUT_DIR, exist_ok=True)
-for subdir in ['part1_sota', 'part2_ablation', 'part3_sensitivity', 'part4_statistics']:
-    os.makedirs(os.path.join(OUTPUT_DIR, subdir), exist_ok=True)
-
-print(f"Benchmark Directory: {BASE_DIR}")
-print(f"Output Directory: {OUTPUT_DIR}")
 
 # ============================================================================
-# MATPLOTLIB STYLE
+# PATHS (portable; override with --instances and --output)
 # ============================================================================
 
-plt.rcParams['font.family'] = 'Times New Roman'
-plt.rcParams['font.size'] = 10
-plt.rcParams['axes.labelsize'] = 11
-plt.rcParams['axes.titlesize'] = 12
-plt.rcParams['legend.fontsize'] = 9
-plt.rcParams['figure.dpi'] = 300
-plt.rcParams['savefig.dpi'] = 300
-plt.rcParams['savefig.bbox'] = 'tight'
-plt.rcParams['pdf.fonttype'] = 42
+SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
+DEFAULT_INSTANCE_DIR = os.path.join(SCRIPT_DIR, "benchmark_instances")
+DEFAULT_OUTPUT_DIR = os.path.join(SCRIPT_DIR, "SA-ALNS_results_v8_9_1")
 
-# Color palettes
+INSTANCE_GENERATOR_VERSION = "v8.7"  # instances unchanged since v8.7
+
+_GLOBAL_SACA_CACHE = {}
+
+
+# ============================================================================
+# DETERMINISTIC SEED
+# ============================================================================
+
+def _stable_seed(*parts) -> int:
+    """
+    Deterministic replacement for hash((...)) % 2**31.
+
+    Python's built-in hash() on strings is randomised per process
+    (PYTHONHASHSEED), which made experimental runs non-reproducible across
+    launches. This helper uses SHA-1 on a canonical string encoding of the
+    parts, which is stable across processes, machines, and Python versions.
+    """
+    payload = "|".join(str(p) for p in parts).encode("utf-8")
+    digest = hashlib.sha1(payload).hexdigest()
+    return int(digest[:8], 16) % (2**31)
+
+
+# ============================================================================
+# STYLE
+# ============================================================================
+
+plt.rcParams["font.family"] = "Times New Roman"
+plt.rcParams["font.size"] = 10
+plt.rcParams["axes.labelsize"] = 11
+plt.rcParams["axes.titlesize"] = 12
+plt.rcParams["legend.fontsize"] = 9
+plt.rcParams["figure.dpi"] = 300
+plt.rcParams["savefig.dpi"] = 300
+plt.rcParams["savefig.bbox"] = "tight"
+plt.rcParams["pdf.fonttype"] = 42
+
 COLORS_SOTA = {
-    'IALNS': '#2E86AB',
-    'Standard_ALNS': '#1A7A5A',
-    'FDAHS': '#E76F51',
-    'GCOF': '#F4A261',
-    'HSA': '#E9C46A',
-    'ACO_2opt': '#2A9D8F',
+    "SA-ALNS": "#2E86AB", "SA-ALNS_CostOnly": "#7FB3D5",
+    "Standard_ALNS": "#1A7A5A", "FDAHS": "#E76F51",
+    "GCOF": "#F4A261", "HSA": "#E9C46A", "ACO_2opt": "#2A9D8F",
 }
-
 SOTA_DISPLAY_NAMES = {
-    'IALNS': 'IALNS (Proposed)',
-    'Standard_ALNS': 'Standard ALNS',
-    'FDAHS': 'FDAHS (2026)',
-    'GCOF': 'GCOF (2026)',
-    'HSA': 'HSA (2023)',
-    'ACO_2opt': 'ACO-2opt (2015)',
+    "SA-ALNS": "SA-ALNS (Proposed)",
+    "SA-ALNS_CostOnly": "SA-ALNS (Cost-Only Ablation)",
+    "Standard_ALNS": "Standard ALNS",
+    "FDAHS": "FDAHS (2026)", "GCOF": "GCOF (2026)",
+    "HSA": "HSA (2023)", "ACO_2opt": "ACO-2opt (2015)",
 }
-
-COLORS_ABLATION = {
-    'IALNS': '#2E86AB',
-    'IALNS_NS': '#F18F01',
-    'IALNS_NA': '#C73E1D',
-    'IALNS_SEQ': '#73AB84',
-    'IALNS_NC': '#6A4C93',
-    'IALNS_IMB': '#D4A373'
-}
-
-ABLATION_DISPLAY_NAMES = {
-    'IALNS': 'IALNS (Full)',
-    'IALNS_NS': 'No Stability',
-    'IALNS_NA': 'No Adaptive',
-    'IALNS_SEQ': 'Sequential',
-    'IALNS_NC': 'No Cache',
-    'IALNS_IMB': 'No Imbalance'
-}
-
-# Compartment colors
-COLORS_COMPARTMENTS = {
-    1: '#2E86AB',
-    2: '#E76F51',
-    3: '#1A7A5A',
-    4: '#F4A261',
-}
-
-COMPARTMENT_LABELS = {
-    1: 'Single-Compartment',
-    2: '2 Compartments',
-    3: '3 Compartments',
-    4: '4 Compartments',
-}
-
 MARKERS = {
-    'IALNS': 'o',
-    'Standard_ALNS': 's',
-    'FDAHS': '^',
-    'GCOF': 'D',
-    'HSA': 'v',
-    'ACO_2opt': 'p',
-    'IALNS (Full)': 'o',
-    'No Stability': '*',
-    'No Adaptive': 'h',
-    'Sequential': '<',
-    'No Cache': '>',
-    'No Imbalance': 'P',
-    'Single-Compartment': 'x',
-    'Multi-Compartment': 'o'
+    "SA-ALNS": "o", "SA-ALNS_CostOnly": "X", "Standard_ALNS": "s",
+    "FDAHS": "^", "GCOF": "D", "HSA": "v", "ACO_2opt": "p",
+    "SA-ALNS_NS": "*", "SA-ALNS_NA": "h", "SA-ALNS_SEQ": "<",
+    "SA-ALNS_NC": ">", "SA-ALNS_IMB": "P",
 }
+COLORS_ABLATION = {
+    "SA-ALNS": "#2E86AB", "SA-ALNS_NS": "#F18F01", "SA-ALNS_NA": "#C73E1D",
+    "SA-ALNS_SEQ": "#73AB84", "SA-ALNS_NC": "#6A4C93", "SA-ALNS_IMB": "#D4A373",
+}
+ABLATION_DISPLAY_NAMES = {
+    "SA-ALNS": "SA-ALNS (Full)", "SA-ALNS_NS": "No Stability",
+    "SA-ALNS_NA": "No Adaptive", "SA-ALNS_SEQ": "Sequential",
+    "SA-ALNS_NC": "No Cache", "SA-ALNS_IMB": "No Imbalance",
+}
+
+
+# ============================================================================
+# SAFE SAVE
+# ============================================================================
+
+def safe_savefig(fig, path, retries=3, sleep=1.0):
+    for attempt in range(retries):
+        try:
+            fig.savefig(path)
+            return path
+        except PermissionError:
+            time.sleep(sleep)
+    try:
+        if os.path.exists(path):
+            os.remove(path)
+    except Exception:
+        pass
+    base, ext = os.path.splitext(path)
+    alt = f"{base}_{int(time.time())}{ext}"
+    try:
+        fig.savefig(alt)
+        print(f"  [warn] {path} locked; wrote {alt} instead")
+        return alt
+    except Exception as e:
+        print(f"  [error] could not save {path}: {e}")
+        return None
+
 
 # ============================================================================
 # DATA STRUCTURES
 # ============================================================================
-
-@dataclass
-class Customer:
-    id: int
-    x: float
-    y: float
-    demand: Dict[int, float]
-    time_window: Tuple[float, float]
-    service_time: float
 
 @dataclass
 class Compartment:
@@ -184,6 +178,7 @@ class Compartment:
     position_x: float
     position_y: float
     load_density: float
+
 
 @dataclass
 class Vehicle:
@@ -207,6 +202,7 @@ class Vehicle:
     compartment_positions: Dict[int, float] = field(default_factory=dict)
     is_multi_compartment: bool = True
 
+
 @dataclass
 class LDDResult:
     feasible: bool
@@ -222,28 +218,28 @@ class LDDResult:
     total_mass: float = 0.0
     longitudinal_moment: float = 0.0
 
+
 @dataclass
 class PerformanceMetrics:
-    # Economic Efficiency Metrics
     total_distance: float
     transportation_cost: float
     fleet_size: int
     fleet_utilization: float
     volume_utilization: float
-    
-    # Safety Compliance Metrics
     ldd_violation_rate: float
     stability_margin: float
     minimum_load_ratio: float
     slosh_risk_score: float
-    
-    # Computational Performance Metrics
     cpu_time: float
     saca_calls: int
     cache_hit_rate: float
-    iterations_to_convergence: int = 0  # Default value added
-    
-    # CG Metrics (additional safety metrics)
+    iterations_to_convergence: int = 0
+    milp_calls: int = 0
+    cache_hits: int = 0
+    milp_time: float = 0.0
+    routing_time: float = 0.0
+    feasibility_failures: int = 0
+    feasibility_attempts: int = 0
     cg_position_mean: float = 0.0
     cg_position_std: float = 0.0
     cg_position_min: float = 0.0
@@ -252,18 +248,18 @@ class PerformanceMetrics:
     cg_deviation_from_optimum: float = 0.0
     heeling_moment_estimate: float = 0.0
     lateral_acceleration_margin: float = 0.0
-    route_cg_positions: List[float] = field(default_factory=list)
-    route_stability_margins: List[float] = field(default_factory=list)
-    route_fill_ratios: List[float] = field(default_factory=list)
-    parameter_combination: Dict[str, float] = field(default_factory=dict)
+    penalised_cost: float = 0.0
+    avg_penalty: float = 0.0
+    n_total_routes: int = 0
+    n_verified_routes: int = 0
+    route_penalty_cache_hits: int = 0
+    route_penalty_cache_hit_rate: float = 0.0
 
 
 @dataclass
 class SensitivityResult:
-    """Results from a single sensitivity analysis run."""
-    lambda_H: float  # Handling cost weight
-    lambda_W: float  # Overload penalty weight
-    lambda_S: float  # Stability penalty weight
+    lambda_W: float
+    lambda_S: float
     avg_cost: float
     avg_stability: float
     avg_ldd_violation: float
@@ -277,4226 +273,3273 @@ class SensitivityResult:
 
 
 # ============================================================================
-# BENCHMARK INSTANCE GENERATOR
-# ============================================================================
-
-def generate_benchmark_instances(output_dir: str, num_instances: int = 281):
-    print(f"\nGenerating {num_instances} synthetic benchmark instances...")
-    all_instances = []
-    instance_counter = 1
-    
-    # Paixão Layer with varying compartments
-    paixao_configs = [
-        ('S', 3, 10, 3, 1),   # Single compartment
-        ('M', 5, 10, 3, 2),   # 2 compartments
-        ('L', 7, 10, 3, 3),   # 3 compartments
-        ('EL', 9, 10, 3, 4),  # 4 compartments
-    ]
-    
-    for prefix, n_customers, count, n_products, n_compartments in paixao_configs:
-        for i in range(1, count + 1):
-            name = f"{prefix}_{i}"
-            instance = generate_single_instance(
-                n_customers=n_customers,
-                layer='Paixão',
-                seed=instance_counter,
-                name=name,
-                n_products=n_products,
-                n_compartments=n_compartments
-            )
-            all_instances.append((name, instance))
-            instance_counter += 1
-    
-    mirzaei_configs = [
-        (10, 2, 15, 3), (10, 3, 10, 3), (10, 4, 5, 4), (10, 5, 3, 4), (10, 6, 2, 4),
-        (12, 2, 12, 3), (12, 3, 8, 3), (12, 4, 4, 4), (12, 5, 3, 4),
-        (15, 2, 10, 3), (15, 3, 8, 3), (15, 4, 5, 4), (15, 5, 3, 4),
-        (20, 2, 10, 3), (20, 3, 8, 3), (20, 4, 5, 4), (20, 5, 3, 4), (20, 6, 2, 4),
-        (25, 2, 8, 3), (25, 3, 6, 3), (25, 4, 4, 4), (25, 5, 3, 4),
-        (30, 2, 8, 3), (30, 3, 6, 3), (30, 4, 4, 4), (30, 5, 2, 4),
-        (40, 2, 6, 3), (40, 3, 5, 4), (40, 4, 3, 4), (40, 5, 2, 4),
-        (50, 2, 6, 3), (50, 3, 5, 4), (50, 4, 3, 4), (50, 5, 2, 4),
-        (60, 2, 5, 3), (60, 3, 4, 4), (60, 4, 3, 4),
-        (75, 2, 5, 3), (75, 3, 4, 4), (75, 4, 2, 4),
-        (100, 2, 5, 3), (100, 3, 3, 4), (100, 4, 2, 4),
-    ]
-    
-    vrpnc_index = 1
-    for n_customers, n_products, count, n_compartments in mirzaei_configs:
-        for j in range(1, count + 1):
-            name = f"vrpnc{vrpnc_index}"
-            instance = generate_single_instance(
-                n_customers=n_customers,
-                layer='Mirzaei',
-                seed=instance_counter,
-                name=name,
-                n_products=n_products,
-                n_compartments=n_compartments
-            )
-            all_instances.append((name, instance))
-            instance_counter += 1
-            vrpnc_index += 1
-    
-    for name, instance in all_instances:
-        filename = f"{name}.json"
-        filepath = os.path.join(output_dir, filename)
-        with open(filepath, 'w') as f:
-            json.dump(instance, f, indent=2)
-        print(f"  Generated: {filename}")
-    
-    print(f"\nGenerated {len(all_instances)} benchmark instances in: {output_dir}")
-    return all_instances
-
-
-def generate_single_instance(n_customers: int, layer: str, seed: int, 
-                            name: str = None, n_products: int = 3,
-                            n_compartments: int = 3) -> Dict:
-    random.seed(seed)
-    np.random.seed(seed)
-    
-    if name is None:
-        name = f"{layer}_{n_customers}"
-    
-    customers = []
-    for i in range(n_customers):
-        x = random.uniform(0, 100)
-        y = random.uniform(0, 100)
-        demand = {}
-        for p in range(n_products):
-            demand[p] = random.uniform(5, 30)
-        start = random.uniform(0, 100)
-        end = start + random.uniform(20, 60)
-        customers.append({
-            'id': i,
-            'x': x,
-            'y': y,
-            'demand': demand,
-            'time_window': [start, end],
-            'service_time': random.uniform(5, 15)
-        })
-    
-    time_windows = {}
-    for i in range(n_customers):
-        start = random.uniform(0, 100)
-        end = start + random.uniform(20, 60)
-        time_windows[i] = [start, end]
-    
-    compartments = []
-    compartment_positions = {}
-    for i in range(n_compartments):
-        pos_x = random.uniform(-2, 2) + i * 1.5
-        compartment_positions[i] = pos_x
-        compartments.append({
-            'id': i,
-            'capacity': random.uniform(30, 80),
-            'position_x': pos_x,
-            'position_y': 0.0,
-            'load_density': 1.0
-        })
-    
-    product_densities = {}
-    for p in range(n_products):
-        product_densities[p] = random.uniform(0.6, 1.2)
-    
-    wheelbase = random.uniform(3, 5)
-    front_axle_max = random.uniform(150, 250)
-    rear_axle_max = random.uniform(200, 350)
-    
-    vehicle = {
-        'id': 0,
-        'compartments': compartments,
-        'compartment_positions': compartment_positions,
-        'max_payload': random.uniform(200, 400),
-        'front_axle_max': front_axle_max,
-        'rear_axle_max': rear_axle_max,
-        'front_axle_min': front_axle_max * 0.1,
-        'rear_axle_min': rear_axle_max * 0.1,
-        'wheelbase': wheelbase,
-        'unladen_weight': random.uniform(50, 100),
-        'max_volume': sum(c['capacity'] for c in compartments),
-        'steering_min_ratio': random.uniform(25, 35),
-        'driving_min_ratio': random.uniform(55, 65),
-        'product_densities': product_densities,
-        'cg_min': 0.3 * wheelbase,
-        'cg_max': 0.7 * wheelbase
-    }
-    
-    coords = [[0, 0]] + [[c['x'], c['y']] for c in customers]
-    dist_matrix = [[math.sqrt((coords[i][0] - coords[j][0])**2 + (coords[i][1] - coords[j][1])**2) 
-                   for j in range(n_customers + 1)] for i in range(n_customers + 1)]
-    
-    return {
-        'name': name,
-        'layer': layer,
-        'customers': customers,
-        'time_windows': time_windows,
-        'vehicle': vehicle,
-        'distance_matrix': dist_matrix,
-        'n_products': n_products,
-        'n_customers': n_customers,
-        'n_compartments': n_compartments
-    }
-
-
-# ============================================================================
 # LDD VERIFIER
 # ============================================================================
 
 class LDDVerifier:
     def __init__(self, vehicle: Vehicle):
         self.vehicle = vehicle
-        self.compartment_positions = {c.id: c.position_x for c in vehicle.compartments}
-        self.front_axle_min = getattr(vehicle, 'front_axle_min', 0.0)
-        self.rear_axle_min = getattr(vehicle, 'rear_axle_min', 0.0)
-        self.cg_min = getattr(vehicle, 'cg_min', 0.3 * vehicle.wheelbase)
-        self.cg_max = getattr(vehicle, 'cg_max', 0.7 * vehicle.wheelbase)
-        
+        self.compartment_positions = {
+            c.id: float(np.clip(c.position_x, 0.0, vehicle.wheelbase))
+            for c in vehicle.compartments
+        }
+        self.front_axle_min = getattr(vehicle, "front_axle_min", 0.0)
+        self.rear_axle_min = getattr(vehicle, "rear_axle_min", 0.0)
+        self.cg_min = getattr(vehicle, "cg_min", 0.3 * vehicle.wheelbase)
+        self.cg_max = getattr(vehicle, "cg_max", 0.7 * vehicle.wheelbase)
+
     def verify_load(self, compartment_loads: Dict[int, float]) -> LDDResult:
+        loads = {k: v for k, v in compartment_loads.items() if v > 1e-9}
+        total_weight = sum(loads.values())
+
+        if total_weight <= 1e-9:
+            unladen = self.vehicle.unladen_weight
+            unladen_cg = 0.5 * self.vehicle.wheelbase
+            rear = unladen * unladen_cg / self.vehicle.wheelbase
+            front = unladen - rear
+            violations = []
+            if front > self.vehicle.front_axle_max:
+                violations.append("front_overload")
+            if rear > self.vehicle.rear_axle_max:
+                violations.append("rear_overload")
+            return LDDResult(
+                feasible=len(violations) == 0,
+                front_load=front, rear_load=rear,
+                center_of_gravity=unladen_cg,
+                stability_margin=100.0, violations=violations,
+                cg_position=unladen_cg, cg_min=self.cg_min, cg_max=self.cg_max,
+                cg_compliant=True, total_mass=0.0, longitudinal_moment=0.0,
+            )
+
+        moment = sum(load * self.compartment_positions.get(cid, 0.5 * self.vehicle.wheelbase)
+                     for cid, load in loads.items())
+        cg_cargo = moment / total_weight
+
+        unladen = self.vehicle.unladen_weight
+        unladen_cg = 0.5 * self.vehicle.wheelbase
+        total_mass = total_weight + unladen
+        cg = (total_weight * cg_cargo + unladen * unladen_cg) / total_mass
+
+        rear = total_mass * cg / self.vehicle.wheelbase
+        front = total_mass - rear
+
         violations = []
-        compartment_loads = {k: v for k, v in compartment_loads.items() if v > 0}
-        total_weight = sum(compartment_loads.values())
-        
-        if total_weight == 0:
-            return LDDResult(True, 0, 0, 0, 100.0, [], 
-                           cg_position=0, cg_min=self.cg_min, cg_max=self.cg_max,
-                           cg_compliant=True, total_mass=0, longitudinal_moment=0)
-        
-        numerator = sum(load * self.compartment_positions.get(c_id, 0) 
-                       for c_id, load in compartment_loads.items())
-        cg_position = numerator / total_weight
-        longitudinal_moment = numerator
-        
-        front_load = total_weight * (self.vehicle.wheelbase - cg_position) / self.vehicle.wheelbase
-        rear_load = total_weight - front_load
-        
-        front_load += self.vehicle.unladen_weight * 0.5
-        rear_load += self.vehicle.unladen_weight * 0.5
-        
-        total_vehicle_weight = total_weight + self.vehicle.unladen_weight
-        
-        if front_load > self.vehicle.front_axle_max:
-            violations.append(f"Front axle overload: {front_load:.2f} > {self.vehicle.front_axle_max}")
-        if front_load < self.front_axle_min:
-            violations.append(f"Front axle underload: {front_load:.2f} < {self.front_axle_min}")
-        if rear_load > self.vehicle.rear_axle_max:
-            violations.append(f"Rear axle overload: {rear_load:.2f} > {self.vehicle.rear_axle_max}")
-        if rear_load < self.rear_axle_min:
-            violations.append(f"Rear axle underload: {rear_load:.2f} < {self.rear_axle_min}")
+        if front > self.vehicle.front_axle_max:
+            violations.append("front_overload")
+        if front < self.front_axle_min:
+            violations.append("front_underload")
+        if rear > self.vehicle.rear_axle_max:
+            violations.append("rear_overload")
+        if rear < self.rear_axle_min:
+            violations.append("rear_underload")
         if total_weight > self.vehicle.max_payload:
-            violations.append(f"Payload exceeds maximum: {total_weight:.2f} > {self.vehicle.max_payload}")
-        
-        cg_compliant = True
-        if cg_position < self.cg_min:
-            violations.append(f"CG too far forward: {cg_position:.2f} < {self.cg_min}")
-            cg_compliant = False
-        if cg_position > self.cg_max:
-            violations.append(f"CG too far rearward: {cg_position:.2f} > {self.cg_max}")
-            cg_compliant = False
-        
-        if total_vehicle_weight > 0:
-            steering_ratio = front_load / total_vehicle_weight
-            if steering_ratio < self.vehicle.steering_min_ratio / 100:
-                violations.append(f"Steering axle underload: {steering_ratio*100:.1f}% < {self.vehicle.steering_min_ratio}%")
-            driving_ratio = rear_load / total_vehicle_weight
-            if driving_ratio < self.vehicle.driving_min_ratio / 100:
-                violations.append(f"Driving axle underload: {driving_ratio*100:.1f}% < {self.vehicle.driving_min_ratio}%")
-        
+            violations.append("payload")
+
+        cg_ok = True
+        if cg < self.cg_min:
+            violations.append("cg_forward")
+            cg_ok = False
+        if cg > self.cg_max:
+            violations.append("cg_rearward")
+            cg_ok = False
+
+        if total_mass > 0:
+            if front / total_mass < self.vehicle.steering_min_ratio:
+                violations.append("steering")
+            if rear / total_mass < self.vehicle.driving_min_ratio:
+                violations.append("driving")
+
         margins = []
-        if self.vehicle.front_axle_max > 0 and front_load > 0:
-            margins.append((self.vehicle.front_axle_max - front_load) / self.vehicle.front_axle_max)
-        if self.vehicle.rear_axle_max > 0 and rear_load > 0:
-            margins.append((self.vehicle.rear_axle_max - rear_load) / self.vehicle.rear_axle_max)
-        if self.vehicle.max_payload > 0 and total_weight > 0:
+        if self.vehicle.front_axle_max > 0:
+            margins.append((self.vehicle.front_axle_max - front) / self.vehicle.front_axle_max)
+        if self.vehicle.rear_axle_max > 0:
+            margins.append((self.vehicle.rear_axle_max - rear) / self.vehicle.rear_axle_max)
+        if self.vehicle.max_payload > 0:
             margins.append((self.vehicle.max_payload - total_weight) / self.vehicle.max_payload)
         if self.cg_max > self.cg_min:
-            cg_margin_min = (cg_position - self.cg_min) / (self.cg_max - self.cg_min)
-            cg_margin_max = (self.cg_max - cg_position) / (self.cg_max - self.cg_min)
-            margins.extend([cg_margin_min, cg_margin_max])
-        
-        stability_margin = min(margins) * 100 if margins else 100.0
-        
+            margins.append((cg - self.cg_min) / (self.cg_max - self.cg_min))
+            margins.append((self.cg_max - cg) / (self.cg_max - self.cg_min))
+        margin = max(0.0, min(margins)) * 100 if margins else 100.0
+
         return LDDResult(
             feasible=len(violations) == 0,
-            front_load=front_load,
-            rear_load=rear_load,
-            center_of_gravity=cg_position,
-            stability_margin=stability_margin,
+            front_load=front, rear_load=rear,
+            center_of_gravity=cg, stability_margin=margin,
             violations=violations,
-            cg_position=cg_position,
-            cg_min=self.cg_min,
-            cg_max=self.cg_max,
-            cg_compliant=cg_compliant,
-            total_mass=total_weight,
-            longitudinal_moment=longitudinal_moment
+            cg_position=cg, cg_min=self.cg_min, cg_max=self.cg_max,
+            cg_compliant=cg_ok, total_mass=total_weight,
+            longitudinal_moment=moment,
         )
 
 
 # ============================================================================
-# SACA (Stability-Aware Compartment Allocation)
+# SACA — sequence-aware + split allocation
 # ============================================================================
 
 class SACA:
-    def __init__(self, vehicle: Vehicle):
+    RISKY_BAND = (0.35, 0.55)
+    MILP_SIZE_LIMIT = 9
+    MILP_TIME_LIMIT = 10.0
+
+    W_AXLE = 100.0
+    W_CG = 500.0
+    W_SLOSH = 2.0
+    SLOSH_PENALTY_CAP_FRACTION = 0.20
+
+    def __init__(self, vehicle: Vehicle, instance_data: Optional[Dict] = None,
+                 stability_weight: float = 0.35, use_cache: bool = True):
         self.vehicle = vehicle
+        self.instance_data = instance_data
         self.ldd_verifier = LDDVerifier(vehicle)
-        self.cache = {}
+        self.stability_weight = stability_weight
+        self._vehicle_sig = self._make_vehicle_signature(vehicle)
+        self.use_cache = use_cache
+        self.cache = _GLOBAL_SACA_CACHE if use_cache else {}
         self.milp_calls = 0
         self.cache_hits = 0
-        self.cg_history = []
-        self.route_cg_positions = []
-        self.route_stability_margins = []
-        
-    def solve_heuristic(self, demands: Dict[int, float], product_densities: Dict[int, float]) -> Tuple[bool, Dict]:
-        cache_key = tuple(sorted(demands.items()))
-        if cache_key in self.cache:
+        self.milp_time = 0.0
+        self.milp_status_log = []
+        self.failure_reasons = defaultdict(int)
+
+    @staticmethod
+    def _make_vehicle_signature(vehicle):
+        caps = tuple(round(c.capacity, 3) for c in vehicle.compartments)
+        pos = tuple(round(c.position_x, 3) for c in vehicle.compartments)
+        return (round(vehicle.wheelbase, 4),
+                round(vehicle.max_volume, 3),
+                round(vehicle.max_payload, 3),
+                caps, pos)
+
+    @staticmethod
+    def _cache_key(route):
+        return hashlib.sha1(repr(tuple(route)).encode()).hexdigest()
+
+    def _sequence_feasible(self, route, demand_by_customer):
+        k = len(route)
+        if k == 0:
+            return True
+        suffix = [dict() for _ in range(k)]
+        running = defaultdict(float)
+        for i in range(k - 1, -1, -1):
+            cust = route[i]
+            for p, v in demand_by_customer[cust].items():
+                running[p] += v
+            suffix[i] = dict(running)
+        for i in range(k):
+            remaining = suffix[i]
+            total_vol = sum(remaining.values())
+            if total_vol > self.vehicle.max_volume + 1e-6:
+                return False
+            n_prod = sum(1 for v in remaining.values() if v > 1e-6)
+            if n_prod > len(self.vehicle.compartments):
+                return False
+        return True
+
+    def verify_route(self, route, demand_by_customer, transport_cost=None,
+                     skip_sequence_check=False):
+        if not route:
+            return 0.0, {}, {}, False
+
+        key = (self._vehicle_sig, SACA._cache_key(route))
+        if self.use_cache and key in self.cache:
             self.cache_hits += 1
-            return self.cache[cache_key]
-        
-        if not demands or sum(demands.values()) == 0:
-            result = (True, {c.id: 0 for c in self.vehicle.compartments})
-            self.cache[cache_key] = result
-            return result
-        
+            return self.cache[key]
+
+        if not skip_sequence_check and not self._sequence_feasible(route, demand_by_customer):
+            self.failure_reasons["sequence_infeasible"] += 1
+            res = (1e6, {}, {}, True)
+            if self.use_cache:
+                self.cache[key] = res
+            return res
+
+        demand = defaultdict(float)
+        for c in route:
+            for p, v in demand_by_customer[c].items():
+                demand[p] += v
+
+        total_volume = sum(demand.values())
+        if total_volume > self.vehicle.max_volume + 1e-6:
+            self.failure_reasons["total_volume"] += 1
+            res = (1e6, {}, {}, True)
+            if self.use_cache:
+                self.cache[key] = res
+            return res
+
+        n_required_products = sum(1 for v in demand.values() if v > 1e-6)
+        if n_required_products > len(self.vehicle.compartments):
+            self.failure_reasons["too_many_products"] += 1
+            res = (1e6, {}, {}, True)
+            if self.use_cache:
+                self.cache[key] = res
+            return res
+
+        vol_alloc, prod_alloc = self._solve_heuristic(demand)
+        if not vol_alloc:
+            vol_alloc, prod_alloc = self._solve_lp(demand)
+
+        if not vol_alloc:
+            self.failure_reasons["allocation"] += 1
+            res = (1e6, {}, {}, True)
+            if self.use_cache:
+                self.cache[key] = res
+            return res
+
+        penalty = self._penalty_from_states(
+            prod_alloc, vol_alloc, route, demand_by_customer,
+            transport_cost=transport_cost,
+        )
+        res = (penalty, vol_alloc, prod_alloc, False)
+        if self.use_cache:
+            self.cache[key] = res
+        return res
+
+    def _solve_heuristic(self, demand):
+        comps = self.vehicle.compartments
+        products = list(demand.keys())
+        if not products or sum(demand.values()) <= 0:
+            return {}, {}
+
+        if sum(1 for v in demand.values() if v > 1e-6) > len(comps):
+            return {}, {}
+
+        sorted_products = sorted(demand.items(), key=lambda x: x[1], reverse=True)
+        comp_state = {c.id: {"alloc": {}, "total": 0.0} for c in comps}
+
+        for product_id, vol_needed in sorted_products:
+            need = vol_needed
+            for comp in comps:
+                if need <= 1e-6:
+                    break
+                st = comp_state[comp.id]
+                if product_id not in st["alloc"]:
+                    continue
+                avail = comp.capacity - st["total"]
+                if avail <= 1e-6:
+                    continue
+                take = min(need, avail)
+                st["alloc"][product_id] += take
+                st["total"] += take
+                need -= take
+
+            for comp in comps:
+                if need <= 1e-6:
+                    break
+                st = comp_state[comp.id]
+                if st["total"] > 1e-6:
+                    continue
+                take = min(need, comp.capacity)
+                st["alloc"][product_id] = take
+                st["total"] = take
+                need -= take
+
+            for comp in comps:
+                if need <= 1e-6:
+                    break
+                st = comp_state[comp.id]
+                if product_id in st["alloc"]:
+                    continue
+                avail = comp.capacity - st["total"]
+                if avail <= 1e-6:
+                    continue
+                take = min(need, avail)
+                st["alloc"][product_id] = take
+                st["total"] += take
+                need -= take
+
+            if need > 1e-3:
+                return {}, {}
+
+        vol_alloc, prod_alloc = {}, {}
+        for cid, st in comp_state.items():
+            if st["total"] <= 1e-6:
+                vol_alloc[cid] = 0.0
+                prod_alloc[cid] = {}
+            else:
+                vol_alloc[cid] = st["total"]
+                prod_alloc[cid] = dict(st["alloc"])
+
+        if abs(sum(vol_alloc.values()) - sum(demand.values())) > 1e-3:
+            return {}, {}
+        return vol_alloc, prod_alloc
+
+    def _solve_lp(self, demand):
+        veh = self.vehicle
+        comps = veh.compartments
+        products = list(demand.keys())
+        if not products or sum(demand.values()) <= 0:
+            return {}, {}
+
+        alpha, beta = self.RISKY_BAND
+        prob = pulp.LpProblem("SACA_LP", pulp.LpMinimize)
+
+        q = {(p, c.id): pulp.LpVariable(f"q_{p}_{c.id}", lowBound=0)
+             for p in products for c in comps}
+        pi = {c.id: pulp.LpVariable(f"pi_{c.id}", lowBound=0) for c in comps}
+
+        for c in comps:
+            prob += pulp.lpSum(q[(p, c.id)] for p in products) <= c.capacity
+        for p in products:
+            prob += pulp.lpSum(q[(p, c.id)] for c in comps) >= demand[p]
+        total_kg = pulp.lpSum(q[(p, c.id)] * 0.8
+                              for p in products for c in comps)
+        prob += total_kg <= veh.max_payload * 2.0
+        for c in comps:
+            f = pulp.lpSum(q[(p, c.id)] for p in products) / max(c.capacity, 1e-9)
+            prob += f - pi[c.id] <= alpha
+            prob += f + pi[c.id] >= beta
+        prob += self.W_SLOSH * pulp.lpSum(pi.values())
+
+        t0 = time.time()
+        try:
+            status_code = prob.solve(pulp.PULP_CBC_CMD(msg=False))
+        except Exception as e:
+            self.milp_time += time.time() - t0
+            self.milp_calls += 1
+            self.milp_status_log.append(f"ERROR:{e}")
+            return {}, {}
+        self.milp_time += time.time() - t0
         self.milp_calls += 1
-        sorted_products = sorted(demands.items(), key=lambda x: x[1], reverse=True)
-        allocation = {c.id: 0 for c in self.vehicle.compartments}
-        assigned_products = {}
-        
-        for product_id, demand_volume in sorted_products:
-            remaining = demand_volume
-            
-            while remaining > 0:
-                best_comp_id = None
-                best_score = float('inf')
-                best_alloc = 0
-                best_ldd_result = None
-                
-                for comp in self.vehicle.compartments:
-                    if comp.id in assigned_products.values():
-                        continue
-                    available = comp.capacity - allocation[comp.id]
-                    if available <= 0:
-                        continue
-                    alloc_amount = min(remaining, available)
-                    if alloc_amount <= 0:
-                        continue
-                    
-                    test_allocation = allocation.copy()
-                    test_allocation[comp.id] += alloc_amount
-                    test_load = {c_id: test_allocation[c_id] * product_densities.get(assigned_products.get(c_id, product_id), 0.8)
-                                for c_id in test_allocation if test_allocation[c_id] > 0}
-                    ldd_result = self.ldd_verifier.verify_load(test_load)
-                    
-                    if ldd_result.feasible:
-                        fill_ratio = test_allocation[comp.id] / comp.capacity
-                        cg_score = abs(ldd_result.cg_position - 0.5 * self.vehicle.wheelbase) / (0.5 * self.vehicle.wheelbase)
-                        score = (1 - fill_ratio) + 0.5 * cg_score + (1 - ldd_result.stability_margin / 100) * 0.3
-                        if score < best_score:
-                            best_score = score
-                            best_comp_id = comp.id
-                            best_alloc = alloc_amount
-                            best_ldd_result = ldd_result
-                
-                if best_comp_id is None:
-                    result = (False, {})
-                    self.cache[cache_key] = result
-                    return result
-                
-                allocation[best_comp_id] += best_alloc
-                assigned_products[best_comp_id] = product_id
-                remaining -= best_alloc
-        
-        final_load = {c_id: allocation[c_id] * product_densities.get(assigned_products.get(c_id, 0), 0.8)
-                     for c_id in allocation if allocation[c_id] > 0}
-        ldd_result = self.ldd_verifier.verify_load(final_load)
-        result = (ldd_result.feasible, allocation)
-        self.cache[cache_key] = result
-        
-        if ldd_result.feasible:
-            self.cg_history.append({
-                'cg_position': ldd_result.cg_position,
-                'stability_margin': ldd_result.stability_margin,
-                'total_mass': ldd_result.total_mass,
-                'front_load': ldd_result.front_load,
-                'rear_load': ldd_result.rear_load
-            })
-            self.route_cg_positions.append(ldd_result.cg_position)
-            self.route_stability_margins.append(ldd_result.stability_margin)
-        
-        return result
+        status = pulp.LpStatus[status_code]
+        self.milp_status_log.append(status)
+        if status not in ("Optimal", "Not Solved"):
+            return {}, {}
+
+        vol_alloc, prod_alloc = {}, {}
+        try:
+            for c in comps:
+                comp_alloc = {}
+                for p in products:
+                    v = pulp.value(q[(p, c.id)])
+                    if v is not None and v > 1e-6:
+                        comp_alloc[p] = v
+                vol_alloc[c.id] = sum(comp_alloc.values())
+                prod_alloc[c.id] = comp_alloc
+        except Exception:
+            return {}, {}
+
+        assigned_per_product = {p: 0.0 for p in products}
+        for cid, alloc in prod_alloc.items():
+            for p, v in alloc.items():
+                assigned_per_product[p] += v
+        for p, needed in demand.items():
+            if assigned_per_product[p] < needed - 1e-3:
+                return {}, {}
+        return vol_alloc, prod_alloc
+
+    def _penalty_from_states(self, prod_alloc, vol_alloc, route, demand_by_customer,
+                              transport_cost=None):
+        load_kg = {}
+        for cid, vol in vol_alloc.items():
+            if vol > 1e-6:
+                load_kg[cid] = vol * 0.8
+        if not load_kg:
+            return 0.0
+
+        ldd = self.ldd_verifier.verify_load(load_kg)
+        penalty = 0.0
+        for v in ldd.violations:
+            if v == "front_overload":
+                penalty += self.W_AXLE * (ldd.front_load - self.vehicle.front_axle_max)
+            elif v == "rear_overload":
+                penalty += self.W_AXLE * (ldd.rear_load - self.vehicle.rear_axle_max)
+            elif v == "payload":
+                penalty += self.W_AXLE * (ldd.total_mass - self.vehicle.max_payload)
+            elif v == "cg_forward":
+                penalty += self.W_CG * (self.vehicle.cg_min - ldd.cg_position)
+            elif v == "cg_rearward":
+                penalty += self.W_CG * (ldd.cg_position - self.vehicle.cg_max)
+
+        slosh_penalty = 0.0
+        for cid, kg in load_kg.items():
+            comp = next((c for c in self.vehicle.compartments if c.id == cid), None)
+            if comp is None or comp.capacity <= 0:
+                continue
+            fill = (kg / 0.8) / comp.capacity
+            if self.RISKY_BAND[0] <= fill <= self.RISKY_BAND[1]:
+                slosh_penalty += self.W_SLOSH * 1.0
+            elif 0.25 <= fill < self.RISKY_BAND[0] or self.RISKY_BAND[1] < fill <= 0.65:
+                slosh_penalty += self.W_SLOSH * 0.5
+
+        if transport_cost is not None and transport_cost > 0:
+            cap = self.SLOSH_PENALTY_CAP_FRACTION * transport_cost
+            slosh_penalty = min(slosh_penalty, cap)
+
+        penalty += slosh_penalty
+        return penalty
+
+
+class SACA_SingleProduct(SACA):
+    def verify_route(self, route, demand_by_customer, transport_cost=None,
+                     skip_sequence_check=False):
+        if not route:
+            return 0.0, {}, {}, False
+        demand = defaultdict(float)
+        for c in route:
+            for p, v in demand_by_customer[c].items():
+                demand[p] += v
+        n_required = sum(1 for v in demand.values() if v > 1e-6)
+        if n_required > 1:
+            self.failure_reasons["multi_product_route"] += 1
+            return (1e6, {}, {}, True)
+        return super().verify_route(route, demand_by_customer, transport_cost,
+                                    skip_sequence_check)
 
 
 # ============================================================================
-# OBJECTIVE CALCULATOR - WITH ALL PERFORMANCE METRICS
+# OBJECTIVE CALCULATOR
 # ============================================================================
 
 class ObjectiveCalculator:
-    def __init__(self, instance_data: Dict, vehicle: Vehicle):
+    def __init__(self, instance_data: Dict, vehicle: Vehicle,
+                 stability_weight: float = 0.35,
+                 saca: Optional[SACA] = None):
         self.instance_data = instance_data
         self.vehicle = vehicle
+        self.stability_weight = stability_weight
         self.ldd_verifier = LDDVerifier(vehicle)
-        self.saca = SACA(vehicle)
-        self.all_cg_positions = []
-        self.all_stability_margins = []
-        self.all_fill_ratios = []
-        self.distance_matrix = instance_data['distance_matrix']
-        self.total_saca_calls = 0
-        self.cache_hits_total = 0
-        
-    def compute_total_distance(self, solution: Dict[int, List[int]]) -> float:
-        """∑_{k∈K}∑_{(i,j)∈A} d_{ij}x_{ij}^k"""
+        if saca is not None:
+            self.saca = saca
+        else:
+            self.saca = SACA(vehicle, instance_data,
+                             stability_weight=stability_weight)
+        self.distance_matrix = instance_data["distance_matrix"]
+
+    def compute_total_distance(self, solution):
         total = 0.0
         for route in solution.values():
             if not route:
                 continue
             nodes = [0] + [c + 1 for c in route] + [0]
-            total += sum(self.distance_matrix[nodes[i]][nodes[i+1]] 
-                        for i in range(len(nodes) - 1))
+            total += sum(self.distance_matrix[nodes[i]][nodes[i + 1]]
+                         for i in range(len(nodes) - 1))
         return total
-    
-    def compute_transportation_cost(self, solution: Dict[int, List[int]]) -> float:
-        """∑_{k∈K} (c^{km} · D_k + c^{fixed} · y_k)"""
-        total_distance = self.compute_total_distance(solution)
-        fleet_size = len(solution)
-        return self.vehicle.cost_per_km * total_distance + self.vehicle.fixed_cost * fleet_size
-    
-    def compute_fleet_size(self, solution: Dict[int, List[int]]) -> int:
-        """∑_{k∈K} y_k - Number of vehicles used"""
+
+    def compute_transportation_cost(self, solution):
+        return (self.vehicle.cost_per_km * self.compute_total_distance(solution)
+                + self.vehicle.fixed_cost * len(solution))
+
+    def _verify_with_cost(self, route):
+        demands = {c: self.instance_data["customers"][c]["demand"] for c in route}
+        travel = self.compute_transportation_cost({0: route})
+        return self.saca.verify_route(route, demands, transport_cost=travel)
+
+    def _iter_verified_routes(self, solution):
+        n_total = sum(1 for r in solution.values() if r)
+        verified = []
+        for route in solution.values():
+            if not route:
+                continue
+            res = self._verify_with_cost(route)
+            verified.append((route, res))
+        n_verified = sum(1 for (_, (_, _, _, hard)) in verified if not hard)
+        return n_total, n_verified, verified
+
+    def compute_penalised_cost(self, solution, lambda_W=1.0, lambda_S=0.5):
+        travel = self.compute_transportation_cost(solution)
+        total_penalty = 0.0
+        for route in solution.values():
+            if not route:
+                continue
+            penalty, _, _, hard = self._verify_with_cost(route)
+            if hard:
+                return float("inf")
+            total_penalty += penalty
+        return travel + (lambda_W + lambda_S) * total_penalty
+
+    def compute_fleet_size(self, solution):
         return len(solution)
-    
-    def compute_fleet_utilization(self, solution: Dict[int, List[int]]) -> float:
-        """Route consolidation efficiency - percentage of vehicles with >80% utilization"""
-        utilized = 0
-        total_vehicles = len(solution)
-        if total_vehicles == 0:
+
+    def compute_fleet_utilization(self, solution):
+        if not solution:
             return 0.0
-        
+        utilized = 0
         for route in solution.values():
             if not route:
                 continue
             demands = self._extract_demands(route)
-            route_volume = sum(demands.values())
-            utilization = route_volume / self.vehicle.max_volume if self.vehicle.max_volume > 0 else 0
-            if utilization >= 0.8:  # 80% threshold for "efficient" utilization
+            util = sum(demands.values()) / max(self.vehicle.max_volume, 1e-9)
+            if util >= 0.8:
                 utilized += 1
-        
-        return (utilized / total_vehicles) * 100
-    
-    def compute_volume_utilization(self, solution: Dict[int, List[int]]) -> float:
-        """(1/|K|) ∑_{k∈K} (∑_{i,p,c} q_{ipck} / Cap^{truck}_k) × 100"""
-        total_volume = 0.0
-        total_capacity = 0.0
+        return utilized / len(solution) * 100
+
+    def compute_volume_utilization(self, solution):
+        total_volume, total_capacity = 0.0, 0.0
         for route in solution.values():
             if not route:
                 continue
-            demands = self._extract_demands(route)
-            total_volume += sum(demands.values())
+            total_volume += sum(self._extract_demands(route).values())
             total_capacity += self.vehicle.max_volume
         return (total_volume / total_capacity * 100) if total_capacity > 0 else 0.0
-    
-    def compute_ldd_violation_rate(self, solution: Dict[int, List[int]]) -> float:
-        """(1/|K|) ∑_{k∈K} I(⋃_{j∈J} {L_{rjk} ∉ [Lmin_{rk}, Lmax_{rk}]}) × 100"""
-        violations = 0
-        total_routes = 0
+
+    def compute_ldd_violation_rate(self, solution):
+        n_total, n_verified, verified = self._iter_verified_routes(solution)
+        if n_verified == 0:
+            return 0.0
+        v = 0
+        for (_, (penalty, _, _, hard)) in verified:
+            if hard:
+                continue
+            if penalty > 1e-6:
+                v += 1
+        return v / n_verified * 100
+
+    def compute_avg_penalty(self, solution):
+        total, n = 0.0, 0
         for route in solution.values():
             if not route:
                 continue
-            total_routes += 1
-            demands = self._extract_demands(route)
-            feasible, allocation = self.saca.solve_heuristic(demands, self.vehicle.product_densities)
-            if allocation:
-                load = {c_id: allocation[c_id] * self.vehicle.product_densities.get(1, 0.8)
-                       for c_id in allocation if allocation[c_id] > 0}
-                ldd_result = self.ldd_verifier.verify_load(load)
-                if not ldd_result.feasible:
-                    violations += 1
-        return (violations / total_routes * 100) if total_routes > 0 else 0.0
-    
-    def compute_stability_margin(self, solution: Dict[int, List[int]]) -> float:
-        """min_{k,j} [min{L_{rjk} - Lmin_{rk}, Lmax_{rk} - L_{rjk}} / max{Lmax_{rk} - Lmin_{rk}, 1}] × 100"""
-        min_margin = float('inf')
+            penalty, _, _, hard = self._verify_with_cost(route)
+            if not hard:
+                total += penalty
+                n += 1
+        return total / max(n, 1)
+
+    def compute_stability_margin(self, solution):
+        n_total, n_verified, verified = self._iter_verified_routes(solution)
+        if n_verified == 0:
+            return 0.0
+        margins = []
+        for (route, (penalty, vol_alloc, _, hard)) in verified:
+            if hard:
+                continue
+            load = {cid: vol_alloc[cid] * 0.8 for cid in vol_alloc if vol_alloc[cid] > 0}
+            ldd = self.ldd_verifier.verify_load(load)
+            if ldd.feasible:
+                margins.append(ldd.stability_margin)
+            else:
+                margins.append(0.0)
+        return float(np.mean(margins)) if margins else 0.0
+
+    def compute_minimum_load_ratio(self, solution):
+        n_total, n_verified, verified = self._iter_verified_routes(solution)
+        if n_verified == 0:
+            return 0.0
+        ratios = []
+        for (route, (penalty, vol_alloc, _, hard)) in verified:
+            if hard:
+                continue
+            load = {cid: vol_alloc[cid] * 0.8 for cid in vol_alloc if vol_alloc[cid] > 0}
+            ldd = self.ldd_verifier.verify_load(load)
+            if ldd.feasible and ldd.total_mass > 0:
+                total_vw = ldd.total_mass + self.vehicle.unladen_weight
+                if total_vw > 0:
+                    ratios.append(ldd.front_load / total_vw * 100)
+        return float(np.mean(ratios)) if ratios else 0.0
+
+    def compute_slosh_risk_score(self, solution):
+        total_risk, n = 0.0, 0
         for route in solution.values():
             if not route:
                 continue
-            demands = self._extract_demands(route)
-            feasible, allocation = self.saca.solve_heuristic(demands, self.vehicle.product_densities)
-            if feasible and allocation:
-                load = {c_id: allocation[c_id] * self.vehicle.product_densities.get(1, 0.8)
-                       for c_id in allocation if allocation[c_id] > 0}
-                ldd_result = self.ldd_verifier.verify_load(load)
-                if ldd_result.feasible:
-                    min_margin = min(min_margin, ldd_result.stability_margin)
-                    self.all_stability_margins.append(ldd_result.stability_margin)
-        return min_margin if min_margin != float('inf') else 100.0
-    
-    def compute_minimum_load_ratio(self, solution: Dict[int, List[int]]) -> float:
-        """min_{k,j} (L_front,jk / (W_jk + U)) × 100 - Steering axle compliance"""
-        min_ratio = float('inf')
+            penalty, _, _, hard = self._verify_with_cost(route)
+            if not hard:
+                total_risk += penalty
+                n += 1
+        return total_risk / max(n, 1)
+
+    def compute_cg_metrics(self, solution):
+        n_total, n_verified, verified = self._iter_verified_routes(solution)
+        if n_verified == 0:
+            return {"cg_position_mean": 0.0, "cg_position_std": 0.0,
+                    "cg_position_min": 0.0, "cg_position_max": 0.0,
+                    "cg_compliance_rate": 0.0,
+                    "cg_deviation_from_optimum": 0.0}
+        cgs = []
+        n_compliant = 0
+        for (route, (penalty, vol_alloc, _, hard)) in verified:
+            if hard:
+                continue
+            load = {cid: vol_alloc[cid] * 0.8 for cid in vol_alloc if vol_alloc[cid] > 0}
+            ldd = self.ldd_verifier.verify_load(load)
+            if ldd.cg_compliant:
+                n_compliant += 1
+            if ldd.feasible:
+                cgs.append(ldd.cg_position)
+        rate = 100.0 * n_compliant / n_verified
+        if not cgs:
+            return {"cg_position_mean": 0.0, "cg_position_std": 0.0,
+                    "cg_position_min": 0.0, "cg_position_max": 0.0,
+                    "cg_compliance_rate": rate,
+                    "cg_deviation_from_optimum": 0.0}
+        mean = float(np.mean(cgs))
+        opt = 0.5 * self.vehicle.wheelbase
+        return {"cg_position_mean": mean,
+                "cg_position_std": float(np.std(cgs)) if len(cgs) > 1 else 0.0,
+                "cg_position_min": float(min(cgs)), "cg_position_max": float(max(cgs)),
+                "cg_compliance_rate": rate,
+                "cg_deviation_from_optimum": abs(mean - opt)}
+
+    def compute_heeling_moment_estimate(self, solution, lateral_acceleration=0.4):
+        max_m = 0.0
         for route in solution.values():
             if not route:
                 continue
-            demands = self._extract_demands(route)
-            feasible, allocation = self.saca.solve_heuristic(demands, self.vehicle.product_densities)
-            if feasible and allocation:
-                load = {c_id: allocation[c_id] * self.vehicle.product_densities.get(1, 0.8)
-                       for c_id in allocation if allocation[c_id] > 0}
-                ldd_result = self.ldd_verifier.verify_load(load)
-                if ldd_result.feasible and ldd_result.total_mass > 0:
-                    total_vehicle_weight = ldd_result.total_mass + self.vehicle.unladen_weight
-                    ratio = ldd_result.front_load / total_vehicle_weight if total_vehicle_weight > 0 else 0
-                    min_ratio = min(min_ratio, ratio * 100)
-        return min_ratio if min_ratio != float('inf') else 100.0
-    
-    def compute_slosh_risk_score(self, solution: Dict[int, List[int]]) -> float:
-        """(1/|K|) ∑_{k∈K} ∑_{c∈C_k} max(0, (ρ V_c ω_c^2 A_c) / F_critical)"""
-        risk_score = 0.0
-        total_compartments = 0
-        for route in solution.values():
-            if not route:
-                continue
-            demands = self._extract_demands(route)
-            feasible, allocation = self.saca.solve_heuristic(demands, self.vehicle.product_densities)
-            if feasible and allocation:
-                for c_id, volume in allocation.items():
-                    comp = next(c for c in self.vehicle.compartments if c.id == c_id)
-                    fill_ratio = volume / comp.capacity if comp.capacity > 0 else 0
-                    # Simplified slosh risk estimation
-                    # ρ = density, V = volume, ω = fill ratio, A = slosh amplitude factor
-                    if 0.35 <= fill_ratio <= 0.55:
-                        risk_score += 1.0  # High slosh risk (partial fill)
-                    elif 0.25 <= fill_ratio <= 0.65:
-                        risk_score += 0.5  # Medium slosh risk
-                    total_compartments += 1
-                    self.all_fill_ratios.append(fill_ratio)
-        return risk_score / max(total_compartments, 1)
-    
-    def compute_cg_metrics(self, solution: Dict[int, List[int]]) -> Dict:
-        """Compute Center of Gravity metrics for all routes."""
-        cg_positions = []
-        route_cg_data = []
-        
-        for vid, route in solution.items():
-            if not route:
-                continue
-            
-            demands = self._extract_demands(route)
-            feasible, allocation = self.saca.solve_heuristic(demands, self.vehicle.product_densities)
-            
-            if feasible and allocation:
-                load = {c_id: allocation[c_id] * self.vehicle.product_densities.get(1, 0.8)
-                       for c_id in allocation if allocation[c_id] > 0}
-                ldd_result = self.ldd_verifier.verify_load(load)
-                
-                if ldd_result.feasible:
-                    cg_positions.append(ldd_result.cg_position)
-                    route_cg_data.append({
-                        'route_id': vid,
-                        'cg_position': ldd_result.cg_position,
-                        'stability_margin': ldd_result.stability_margin,
-                        'front_load': ldd_result.front_load,
-                        'rear_load': ldd_result.rear_load,
-                        'total_mass': ldd_result.total_mass,
-                        'n_customers': len(route)
-                    })
-        
-        if not cg_positions:
-            return {
-                'cg_position_mean': 0,
-                'cg_position_std': 0,
-                'cg_position_min': 0,
-                'cg_position_max': 0,
-                'cg_compliance_rate': 100.0,
-                'cg_deviation_from_optimum': 0,
-                'route_cg_data': []
-            }
-        
-        cg_mean = np.mean(cg_positions)
-        cg_std = np.std(cg_positions) if len(cg_positions) > 1 else 0
-        cg_min = min(cg_positions)
-        cg_max = max(cg_positions)
-        
-        optimum_cg = 0.45 * self.vehicle.wheelbase
-        cg_deviation = abs(cg_mean - optimum_cg)
-        
-        cg_min_bound = 0.3 * self.vehicle.wheelbase
-        cg_max_bound = 0.7 * self.vehicle.wheelbase
-        compliant_count = sum(1 for cg in cg_positions if cg_min_bound <= cg <= cg_max_bound)
-        compliance_rate = (compliant_count / len(cg_positions)) * 100 if cg_positions else 100.0
-        
-        return {
-            'cg_position_mean': cg_mean,
-            'cg_position_std': cg_std,
-            'cg_position_min': cg_min,
-            'cg_position_max': cg_max,
-            'cg_compliance_rate': compliance_rate,
-            'cg_deviation_from_optimum': cg_deviation,
-            'route_cg_data': route_cg_data
-        }
-    
-    def compute_heeling_moment_estimate(self, solution: Dict[int, List[int]], 
-                                       lateral_acceleration: float = 0.4) -> float:
-        """Estimate heeling moment due to lateral acceleration."""
-        max_moment = 0.0
-        for route in solution.values():
-            if not route:
-                continue
-            demands = self._extract_demands(route)
-            feasible, allocation = self.saca.solve_heuristic(demands, self.vehicle.product_densities)
-            if feasible and allocation:
-                load = {c_id: allocation[c_id] * self.vehicle.product_densities.get(1, 0.8)
-                       for c_id in allocation if allocation[c_id] > 0}
+            penalty, vol_alloc, _, hard = self._verify_with_cost(route)
+            if not hard and vol_alloc:
+                load = {cid: vol_alloc[cid] * 0.8 for cid in vol_alloc if vol_alloc[cid] > 0}
                 total_mass = sum(load.values())
-                cg_height = 0.5 + np.mean([self.ldd_verifier.compartment_positions.get(c_id, 0) 
-                                          for c_id in load.keys()])
-                heeling_moment = total_mass * lateral_acceleration * cg_height
-                max_moment = max(max_moment, heeling_moment)
-        return max_moment
-    
-    def compute_lateral_acceleration_margin(self, solution: Dict[int, List[int]], 
-                                           max_heeling_moment: float = 1000) -> float:
-        """Compute lateral acceleration margin."""
-        heeling_moment = self.compute_heeling_moment_estimate(solution)
-        if heeling_moment > 0:
-            return (max_heeling_moment - heeling_moment) / max_heeling_moment * 100
-        return 100.0
-    
-    def _extract_demands(self, route: List[int]) -> Dict[int, float]:
+                cg_h = 0.5 + float(np.mean(
+                    [self.ldd_verifier.compartment_positions.get(cid, 0) for cid in load]))
+                max_m = max(max_m, total_mass * lateral_acceleration * cg_h)
+        return max_m
+
+    def compute_lateral_acceleration_margin(self, solution, max_heeling=1000):
+        hm = self.compute_heeling_moment_estimate(solution)
+        return (max_heeling - hm) / max_heeling * 100 if hm > 0 else 100.0
+
+    def _extract_demands(self, route):
         demands = defaultdict(float)
-        for customer_id in route:
-            for product_id, volume in self.instance_data['customers'][customer_id]['demand'].items():
-                demands[product_id] += volume
+        for cid in route:
+            for p, v in self.instance_data["customers"][cid]["demand"].items():
+                demands[p] += v
         return dict(demands)
-    
-    def compute_all_metrics(self, solution: Dict[int, List[int]], 
-                            iterations_to_convergence: int = 0) -> PerformanceMetrics:
-        """Compute all performance metrics as defined in Table 1."""
-        start_time = time.time()
-        
-        # Economic Efficiency Metrics
+
+    def compute_all_metrics(self, solution, iterations_to_convergence=0,
+                            routing_time=0.0, milp_time=0.0,
+                            lambda_W=1.0, lambda_S=0.5):
+        start = time.time()
         total_distance = self.compute_total_distance(solution)
         transportation_cost = self.compute_transportation_cost(solution)
+        penalised_cost = self.compute_penalised_cost(solution, lambda_W, lambda_S)
+        avg_penalty = self.compute_avg_penalty(solution)
         fleet_size = self.compute_fleet_size(solution)
-        fleet_utilization = self.compute_fleet_utilization(solution)
-        volume_utilization = self.compute_volume_utilization(solution)
-        
-        # Safety Compliance Metrics
-        ldd_violation_rate = self.compute_ldd_violation_rate(solution)
-        stability_margin = self.compute_stability_margin(solution)
-        minimum_load_ratio = self.compute_minimum_load_ratio(solution)
-        slosh_risk = self.compute_slosh_risk_score(solution)
-        
-        # CG Metrics
-        cg_metrics = self.compute_cg_metrics(solution)
-        heeling_moment = self.compute_heeling_moment_estimate(solution)
-        lateral_margin = self.compute_lateral_acceleration_margin(solution)
-        
-        # Computational Performance
-        cpu_time = time.time() - start_time
-        saca_calls = self.saca.milp_calls
-        cache_hit_rate = (self.saca.cache_hits / max(1, self.saca.milp_calls + self.saca.cache_hits)) * 100
-        
+        fleet_util = self.compute_fleet_utilization(solution)
+        vol_util = self.compute_volume_utilization(solution)
+        ldd_v = self.compute_ldd_violation_rate(solution)
+        stability = self.compute_stability_margin(solution)
+        min_ratio = self.compute_minimum_load_ratio(solution)
+        slosh = self.compute_slosh_risk_score(solution)
+        cg = self.compute_cg_metrics(solution)
+        hm = self.compute_heeling_moment_estimate(solution)
+        lm = self.compute_lateral_acceleration_margin(solution)
+        wall = time.time() - start
+
+        n_total, n_verified, _ = self._iter_verified_routes(solution)
+
         return PerformanceMetrics(
-            # Economic Efficiency
-            total_distance=total_distance,
-            transportation_cost=transportation_cost,
-            fleet_size=fleet_size,
-            fleet_utilization=fleet_utilization,
-            volume_utilization=volume_utilization,
-            # Safety Compliance
-            ldd_violation_rate=ldd_violation_rate,
-            stability_margin=stability_margin,
-            minimum_load_ratio=minimum_load_ratio,
-            slosh_risk_score=slosh_risk,
-            # Computational Performance
-            cpu_time=cpu_time,
-            saca_calls=saca_calls,
-            cache_hit_rate=cache_hit_rate,
+            total_distance=total_distance, transportation_cost=transportation_cost,
+            fleet_size=fleet_size, fleet_utilization=fleet_util,
+            volume_utilization=vol_util, ldd_violation_rate=ldd_v,
+            stability_margin=stability, minimum_load_ratio=min_ratio,
+            slosh_risk_score=slosh,
+            cpu_time=routing_time + milp_time + wall,
+            saca_calls=self.saca.milp_calls,
+            cache_hit_rate=(self.saca.cache_hits /
+                            max(1, self.saca.milp_calls + self.saca.cache_hits)) * 100,
             iterations_to_convergence=iterations_to_convergence,
-            # CG Metrics
-            cg_position_mean=cg_metrics['cg_position_mean'],
-            cg_position_std=cg_metrics['cg_position_std'],
-            cg_position_min=cg_metrics['cg_position_min'],
-            cg_position_max=cg_metrics['cg_position_max'],
-            cg_compliance_rate=cg_metrics['cg_compliance_rate'],
-            cg_deviation_from_optimum=cg_metrics['cg_deviation_from_optimum'],
-            heeling_moment_estimate=heeling_moment,
-            lateral_acceleration_margin=lateral_margin,
-            route_cg_positions=[d['cg_position'] for d in cg_metrics['route_cg_data']],
-            route_stability_margins=[d['stability_margin'] for d in cg_metrics['route_cg_data']],
-            route_fill_ratios=self.all_fill_ratios.copy()
-        )
+            milp_calls=self.saca.milp_calls,
+            cache_hits=self.saca.cache_hits,
+            milp_time=milp_time, routing_time=routing_time,
+            cg_position_mean=cg["cg_position_mean"],
+            cg_position_std=cg["cg_position_std"],
+            cg_position_min=cg["cg_position_min"],
+            cg_position_max=cg["cg_position_max"],
+            cg_compliance_rate=cg["cg_compliance_rate"],
+            cg_deviation_from_optimum=cg["cg_deviation_from_optimum"],
+            heeling_moment_estimate=hm,
+            lateral_acceleration_margin=lm,
+            penalised_cost=penalised_cost,
+            avg_penalty=avg_penalty,
+            n_total_routes=n_total,
+            n_verified_routes=n_verified)
 
 
 # ============================================================================
-# SINGLE-COMPARTMENT VEHICLE CREATOR
+# BENCHMARK GENERATION
 # ============================================================================
 
-def create_single_compartment_vehicle(instance: Dict) -> Vehicle:
-    """Create a single-compartment vehicle for comparison."""
-    vehicle_data = instance['vehicle']
-    
-    total_capacity = sum(c['capacity'] for c in vehicle_data['compartments'])
-    avg_position = np.mean([c['position_x'] for c in vehicle_data['compartments']])
-    
-    compartments = [Compartment(
-        id=0,
-        capacity=total_capacity,
-        position_x=avg_position,
-        position_y=0.0,
-        load_density=1.0
-    )]
-    
-    product_densities = vehicle_data.get('product_densities', {})
-    
+def generate_single_instance(n_customers, layer, seed, name=None,
+                             n_products=4, n_compartments=3):
+    random.seed(seed)
+    np.random.seed(seed)
+    if name is None:
+        name = f"{layer}_{n_customers}"
+
+    n_products = max(2, min(n_products, n_compartments + 2))
+    wb = random.uniform(3.0, 5.0)
+
+    comps = []
+    comp_pos = {}
+    for i in range(n_compartments):
+        frac = 0.30 + 0.40 * (i + 0.5) / n_compartments
+        px = wb * frac
+        comp_pos[i] = px
+        comps.append({
+            "id": i,
+            "capacity": random.uniform(120.0, 200.0),
+            "position_x": px, "position_y": 0.0, "load_density": 1.0,
+        })
+
+    total_capacity = sum(c["capacity"] for c in comps)
+    max_payload = total_capacity * 0.8
+    unladen = max_payload * random.uniform(0.30, 0.50)
+    total_gvw = max_payload + unladen
+    fx = total_gvw * 0.50
+    rx = total_gvw * 0.65
+
+    avg_comp_cap = total_capacity / n_compartments
+    demand_max = avg_comp_cap * random.uniform(0.60, 0.90)
+    demand_min = demand_max * 0.40
+
+    customers = []
+    for i in range(n_customers):
+        p = random.randint(0, n_products - 1)
+        demand = {p: random.uniform(demand_min, demand_max)}
+        customers.append({
+            "id": i,
+            "x": random.uniform(0, 100),
+            "y": random.uniform(0, 100),
+            "demand": demand,
+            "time_window": [0.0, 1440.0],
+            "service_time": random.uniform(5, 15),
+        })
+
+    tws = {}
+    for i in range(n_customers):
+        s = random.uniform(0, 100)
+        tws[i] = [s, s + random.uniform(20, 60)]
+        customers[i]["time_window"] = tws[i]
+
+    prod_dens = {p: 0.8 for p in range(n_products)}
+    vehicle = {
+        "id": 0, "compartments": comps, "compartment_positions": comp_pos,
+        "max_payload": max_payload,
+        "front_axle_max": fx, "rear_axle_max": rx,
+        "front_axle_min": fx * 0.10, "rear_axle_min": rx * 0.10,
+        "wheelbase": wb, "unladen_weight": unladen,
+        "max_volume": total_capacity,
+        "steering_min_ratio": 0.25, "driving_min_ratio": 0.55,
+        "product_densities": prod_dens,
+        "cg_min": 0.3 * wb, "cg_max": 0.7 * wb,
+    }
+
+    coords = [[0, 0]] + [[c["x"], c["y"]] for c in customers]
+    dm = [[math.sqrt((coords[i][0] - coords[j][0]) ** 2 +
+                     (coords[i][1] - coords[j][1]) ** 2)
+           for j in range(n_customers + 1)] for i in range(n_customers + 1)]
+
+    return {
+        "name": name, "layer": layer, "customers": customers,
+        "time_windows": tws, "vehicle": vehicle,
+        "distance_matrix": dm, "n_products": n_products,
+        "n_customers": n_customers, "n_compartments": n_compartments,
+    }
+
+
+def generate_benchmark_instances(output_dir, num_instances=100):
+    print(f"\nGenerating {num_instances} synthetic benchmark instances ...")
+    all_instances = []
+
+    paixao = [
+        ("P20", 20, 4, 3),
+        ("P25", 25, 4, 3),
+        ("P30", 30, 4, 4),
+    ]
+    mirzaei = [
+        (40, 4, 3), (40, 5, 3), (40, 4, 4),
+        (50, 4, 3), (50, 5, 3), (50, 5, 4),
+        (60, 5, 3), (60, 5, 4), (60, 4, 4),
+        (75, 5, 4), (75, 5, 4), (75, 4, 5),
+        (100, 5, 4), (100, 5, 5), (100, 4, 5),
+    ]
+
+    ctr = 1
+    for prefix, n, npr, ncmp in paixao:
+        for i in range(1, 6):
+            name = f"{prefix}_{i}"
+            all_instances.append((name, generate_single_instance(
+                n_customers=n, layer="Paixao", seed=ctr, name=name,
+                n_products=npr, n_compartments=ncmp)))
+            ctr += 1
+
+    idx = 1
+    for n, npr, ncmp in mirzaei:
+        name = f"vrpnc{idx}"
+        all_instances.append((name, generate_single_instance(
+            n_customers=n, layer="Mirzaei", seed=ctr, name=name,
+            n_products=npr, n_compartments=ncmp)))
+        ctr += 1
+        idx += 1
+
+    while len(all_instances) < num_instances:
+        n = random.choice([20, 25, 30, 40, 50, 60, 75, 100])
+        npr = random.choice([3, 4, 5])
+        ncmp = random.choice([3, 4, 5])
+        name = f"extra{len(all_instances)+1}"
+        all_instances.append((name, generate_single_instance(
+            n_customers=n, layer="Mirzaei", seed=ctr, name=name,
+            n_products=npr, n_compartments=ncmp)))
+        ctr += 1
+
+    for name, inst in all_instances:
+        with open(os.path.join(output_dir, f"{name}.json"), "w") as f:
+            json.dump(inst, f, indent=2)
+    print(f"Generated {len(all_instances)} instances in {output_dir}")
+    return all_instances
+
+
+def _instance_generator_is_current(base_dir):
+    marker = os.path.join(base_dir, ".instance_generator_version")
+    if not os.path.exists(marker):
+        return False
+    try:
+        with open(marker, "r") as f:
+            version = f.read().strip()
+        return version == INSTANCE_GENERATOR_VERSION
+    except Exception:
+        return False
+
+
+def _write_instance_generator_marker(base_dir):
+    marker = os.path.join(base_dir, ".instance_generator_version")
+    with open(marker, "w") as f:
+        f.write(INSTANCE_GENERATOR_VERSION)
+
+
+def ensure_instances(base_dir):
+    current = _instance_generator_is_current(base_dir)
+    if current:
+        js = [f for _, _, fs in os.walk(base_dir)
+              for f in fs if f.endswith(".json")]
+        if js:
+            print(f"Instances are current ({INSTANCE_GENERATOR_VERSION}); "
+                  f"found {len(js)} .json files. Skipping regeneration.")
+            return
+
+    print(f"\nInstance generator marker missing or stale. "
+          f"Regenerating all instances with {INSTANCE_GENERATOR_VERSION} ...")
+    removed = 0
+    for root, dirs, files in os.walk(base_dir):
+        if "experimental_results" in root or "SA-ALNS_results" in root:
+            continue
+        for f in files:
+            if f.endswith(".json"):
+                os.remove(os.path.join(root, f))
+                removed += 1
+    if removed:
+        print(f"  Removed {removed} stale .json files.")
+    generate_benchmark_instances(base_dir, num_instances=100)
+    _write_instance_generator_marker(base_dir)
+    print(f"  Wrote version marker {INSTANCE_GENERATOR_VERSION}.")
+
+
+# ============================================================================
+# VEHICLE CREATORS
+# ============================================================================
+
+def create_vehicle_from_instance(instance, multi_compartment=True):
+    vd = instance["vehicle"]
+    raw = vd["compartments"]
+    if multi_compartment:
+        compartments = [Compartment(id=c["id"], capacity=c["capacity"],
+                                    position_x=c["position_x"],
+                                    position_y=c["position_y"],
+                                    load_density=1.0) for c in raw]
+        positions = {c["id"]: c["position_x"] for c in raw}
+        total_cap = sum(c.capacity for c in compartments)
+    else:
+        total_cap = sum(c["capacity"] for c in raw)
+        weighted_x = sum(c["capacity"] * c["position_x"] for c in raw) / max(total_cap, 1e-9)
+        compartments = [Compartment(id=0, capacity=total_cap,
+                                    position_x=weighted_x, position_y=0.0,
+                                    load_density=1.0)]
+        positions = {0: weighted_x}
     return Vehicle(
-        id=0,
-        compartments=compartments,
-        max_payload=vehicle_data['max_payload'],
-        front_axle_max=vehicle_data['front_axle_max'],
-        rear_axle_max=vehicle_data['rear_axle_max'],
-        wheelbase=vehicle_data['wheelbase'],
-        unladen_weight=vehicle_data['unladen_weight'],
-        max_volume=total_capacity,
-        steering_min_ratio=vehicle_data['steering_min_ratio'],
-        driving_min_ratio=vehicle_data['driving_min_ratio'],
-        product_densities=product_densities,
-        fixed_cost=100.0,
-        cost_per_km=1.0,
-        front_axle_min=vehicle_data.get('front_axle_min', vehicle_data['front_axle_max'] * 0.1),
-        rear_axle_min=vehicle_data.get('rear_axle_min', vehicle_data['rear_axle_max'] * 0.1),
-        cg_min=vehicle_data.get('cg_min', 0.3 * vehicle_data['wheelbase']),
-        cg_max=vehicle_data.get('cg_max', 0.7 * vehicle_data['wheelbase']),
-        compartment_positions={0: avg_position},
-        is_multi_compartment=False
-    )
+        id=0, compartments=compartments,
+        max_payload=vd["max_payload"], front_axle_max=vd["front_axle_max"],
+        rear_axle_max=vd["rear_axle_max"], wheelbase=vd["wheelbase"],
+        unladen_weight=vd["unladen_weight"], max_volume=total_cap,
+        steering_min_ratio=vd["steering_min_ratio"],
+        driving_min_ratio=vd["driving_min_ratio"],
+        product_densities=vd.get("product_densities", {}),
+        fixed_cost=100.0, cost_per_km=1.0,
+        front_axle_min=vd.get("front_axle_min", vd["front_axle_max"] * 0.1),
+        rear_axle_min=vd.get("rear_axle_min", vd["rear_axle_max"] * 0.1),
+        cg_min=vd.get("cg_min", 0.3 * vd["wheelbase"]),
+        cg_max=vd.get("cg_max", 0.7 * vd["wheelbase"]),
+        compartment_positions=positions,
+        is_multi_compartment=multi_compartment)
+
+
+def build_instance_data(instance):
+    n = len(instance["customers"])
+    coords = [[0, 0]] + [[c["x"], c["y"]] for c in instance["customers"]]
+    dm = [[math.sqrt((coords[i][0] - coords[j][0]) ** 2 +
+                     (coords[i][1] - coords[j][1]) ** 2)
+           for j in range(n + 1)] for i in range(n + 1)]
+    return {
+        "name": instance["name"],
+        "customers": instance["customers"],
+        "time_windows": instance["time_windows"],
+        "distance_matrix": dm,
+        "vehicle": instance["vehicle"],
+        "n_products": instance.get("n_products", 4),
+        "n_customers": n,
+        "n_compartments": instance.get("n_compartments",
+                                        len(instance["vehicle"]["compartments"])),
+    }
 
 
 # ============================================================================
-# BASE ALGORITHM CLASS
+# BASE ALGORITHM
 # ============================================================================
 
 class BaseAlgorithm:
-    """Base class with common functionality for all algorithms."""
-    
-    def __init__(self, instance_data: Dict, vehicle: Vehicle):
+    def __init__(self, instance_data, vehicle, stability_weight=0.35):
         self.instance_data = instance_data
         self.vehicle = vehicle
-        self.saca = SACA(vehicle)
-        self.calc = ObjectiveCalculator(instance_data, vehicle)
-        self.distance_matrix = instance_data['distance_matrix']
+        self.stability_weight = stability_weight
+
+        self.saca = SACA(vehicle, instance_data,
+                         stability_weight=stability_weight)
+        self.calc = ObjectiveCalculator(instance_data, vehicle,
+                                        stability_weight=stability_weight,
+                                        saca=self.saca)
+
+        self.distance_matrix = instance_data["distance_matrix"]
         self.feasibility_cache = {}
-        self.milp_calls = 0
         self.cache_hits = 0
-        self.n_customers = len(instance_data['customers'])
+        self.n_customers = len(instance_data["customers"])
         self.convergence_history = []
-        
-    def _is_route_feasible(self, route: List[int]) -> bool:
+        self.feasibility_attempts = 0
+        self.feasibility_failures = 0
+        self.lambda_W = 1.0
+        self.lambda_S = 0.5
+
+    def _is_complete(self, solution):
+        """
+        True iff every customer 0..n_customers-1 appears exactly once across
+        all routes. Rejects duplicated and missing customers.
+        """
+        seen = set()
+        for route in solution.values():
+            for c in route:
+                if c in seen:
+                    return False
+                seen.add(c)
+        return len(seen) == self.n_customers
+
+    def _route_penalty(self, route):
         if not route:
-            return True
-        route_key = tuple(sorted(route))
-        if route_key in self.feasibility_cache:
+            return 0.0, False
+        key = SACA._cache_key(route)
+        if key in self.feasibility_cache:
             self.cache_hits += 1
-            return self.feasibility_cache[route_key]
-        
-        demands = self._extract_demands(route)
-        total_volume = sum(demands.values())
-        if total_volume > self.vehicle.max_volume:
-            self.feasibility_cache[route_key] = False
-            return False
-        
-        self.milp_calls += 1
-        feasible, _ = self.saca.solve_heuristic(demands, self.vehicle.product_densities)
-        self.feasibility_cache[route_key] = feasible
-        return feasible
-    
-    def _extract_demands(self, route: List[int]) -> Dict[int, float]:
-        demands = defaultdict(float)
-        for customer_id in route:
-            for product_id, volume in self.instance_data['customers'][customer_id]['demand'].items():
-                demands[product_id] += volume
-        return dict(demands)
-    
-    def _generate_initial_solution(self) -> Dict[int, List[int]]:
-        unassigned = list(range(self.n_customers))
-        random.shuffle(unassigned)
+            return self.feasibility_cache[key]
+        self.feasibility_attempts += 1
+
+        demands_by_cust = {c: self.instance_data["customers"][c]["demand"] for c in route}
+
+        if not self.saca._sequence_feasible(route, demands_by_cust):
+            self.feasibility_cache[key] = (1e6, True)
+            self.feasibility_failures += 1
+            return 1e6, True
+
+        travel = self.calc.compute_transportation_cost({0: route})
+        penalty, _, _, hard = self.saca.verify_route(
+            route, demands_by_cust, transport_cost=travel,
+            skip_sequence_check=True)
+        self.feasibility_cache[key] = (penalty, hard)
+        if hard or penalty > 1e-6:
+            self.feasibility_failures += 1
+        return penalty, hard
+
+    def _route_score(self, route, vid=0):
+        penalty, hard = self._route_penalty(route)
+        if hard:
+            return 1e9
+        travel = self.calc.compute_transportation_cost({vid: route})
+        return travel + (self.lambda_W + self.lambda_S) * penalty
+
+    def _extract_demands(self, route):
+        d = defaultdict(float)
+        for cid in route:
+            for p, v in self.instance_data["customers"][cid]["demand"].items():
+                d[p] += v
+        return dict(d)
+
+    def _generate_initial_solution(self):
+        solution = self._greedy_insert(list(range(self.n_customers)))
+        if self._is_trivial(solution):
+            ordered = sorted(
+                range(self.n_customers),
+                key=lambda c: -sum(
+                    self.instance_data["customers"][c]["demand"].values()
+                ),
+            )
+            solution = self._greedy_insert(ordered)
+        if self._is_trivial(solution):
+            for _ in range(3):
+                perm = list(range(self.n_customers))
+                random.shuffle(perm)
+                solution = self._greedy_insert(perm)
+                if not self._is_trivial(solution):
+                    break
+        return solution
+
+    def _greedy_insert(self, order):
         solution = {}
-        
-        for customer in unassigned:
-            inserted = False
-            best_vid = None
-            best_pos = None
-            best_cost = float('inf')
-            
+        for customer in order:
+            best_vid, best_pos, best_score = None, None, float("inf")
             for vid, route in solution.items():
                 for pos in range(len(route) + 1):
-                    test_route = route[:pos] + [customer] + route[pos:]
-                    if self._is_route_feasible(test_route):
-                        cost = self.calc.compute_transportation_cost({vid: test_route})
-                        if cost < best_cost:
-                            best_cost = cost
-                            best_vid = vid
-                            best_pos = pos
-                            inserted = True
-            
-            if inserted:
+                    test = route[:pos] + [customer] + route[pos:]
+                    pen, hard = self._route_penalty(test)
+                    if hard:
+                        continue
+                    score = (self.calc.compute_transportation_cost({vid: test})
+                             + (self.lambda_W + self.lambda_S) * pen)
+                    if score < best_score:
+                        best_score, best_vid, best_pos = score, vid, pos
+            if best_vid is not None:
                 solution[best_vid].insert(best_pos, customer)
             else:
                 solution[len(solution)] = [customer]
-        
         return solution
-    
-    def _two_opt_improvement(self, solution: Dict[int, List[int]]) -> Dict[int, List[int]]:
-        new_solution = {k: v.copy() for k, v in solution.items()}
-        
-        for vid in list(new_solution.keys()):
-            route = new_solution[vid]
+
+    @staticmethod
+    def _is_trivial(solution):
+        return bool(solution) and all(len(r) == 1 for r in solution.values())
+
+    def _two_opt_improvement(self, solution):
+        new = {k: v.copy() for k, v in solution.items()}
+        for vid in list(new.keys()):
+            route = new[vid]
             if len(route) < 3:
                 continue
-            
             improved = True
             while improved:
                 improved = False
                 for i in range(len(route) - 2):
                     for j in range(i + 2, len(route)):
-                        new_route = route[:i] + route[i:j+1][::-1] + route[j+1:]
-                        if self._is_route_feasible(new_route):
-                            new_cost = self.calc.compute_transportation_cost({vid: new_route})
-                            old_cost = self.calc.compute_transportation_cost({vid: route})
-                            if new_cost < old_cost:
-                                route = new_route
-                                improved = True
-                                break
+                        nr = route[:i] + route[i:j + 1][::-1] + route[j + 1:]
+                        pen, hard = self._route_penalty(nr)
+                        if hard:
+                            continue
+                        cur_score = (self.calc.compute_transportation_cost({vid: route})
+                                     + (self.lambda_W + self.lambda_S) *
+                                     self._route_penalty(route)[0])
+                        new_score = (self.calc.compute_transportation_cost({vid: nr})
+                                     + (self.lambda_W + self.lambda_S) * pen)
+                        if new_score < cur_score:
+                            route = nr
+                            improved = True
+                            break
                     if improved:
                         break
-            
-            new_solution[vid] = route
-        
-        return new_solution
+            new[vid] = route
+        return new
+
+    def _finalize(self, solution, iterations, wall_clock):
+        m = self.calc.compute_all_metrics(
+            solution, iterations_to_convergence=iterations,
+            routing_time=wall_clock, milp_time=self.saca.milp_time,
+            lambda_W=self.lambda_W, lambda_S=self.lambda_S)
+        m.feasibility_attempts = self.feasibility_attempts
+        m.feasibility_failures = self.feasibility_failures
+        total_lookups = self.feasibility_attempts + self.cache_hits
+        m.route_penalty_cache_hits = self.cache_hits
+        m.route_penalty_cache_hit_rate = (
+            100.0 * self.cache_hits / total_lookups if total_lookups > 0 else 0.0)
+        return m
 
 
 # ============================================================================
-# ALGORITHM 1: STANDARD ALNS
+# STANDARD ALNS
 # ============================================================================
 
 class StandardALNS(BaseAlgorithm):
-    def __init__(self, instance_data: Dict, vehicle: Vehicle, params: Dict = None):
-        super().__init__(instance_data, vehicle)
+    def __init__(self, instance_data, vehicle, params=None, stability_weight=0.35):
+        super().__init__(instance_data, vehicle, stability_weight=stability_weight)
         self.params = params or {
-            'max_iterations': 150,
-            'initial_temperature': 100.0,
-            'cooling_rate': 0.99,
-            'destruction_rate': 0.3,
-            'max_no_improvement': 50
+            "max_iterations": 150, "initial_temperature": 100.0,
+            "cooling_rate": 0.99, "destruction_rate": 0.3,
+            "max_no_improvement": 50,
         }
-        self.destroy_operators = ['random', 'worst', 'shaw']
-        self.repair_operators = ['greedy', 'regret']
-        
-    def solve(self) -> Tuple[Dict[int, List[int]], float, Dict]:
-        start_time = time.time()
-        
+
+    def solve(self):
+        t0 = time.time()
         solution = self._generate_initial_solution()
-        current_cost = self.calc.compute_transportation_cost(solution)
-        best_solution = solution.copy()
-        best_cost = current_cost
-        best_metrics = self.calc.compute_all_metrics(solution, iterations_to_convergence=0)
-        
-        temperature = self.params['initial_temperature']
-        iterations = 0
-        no_improvement = 0
-        
-        while iterations < self.params['max_iterations']:
-            iterations += 1
-            
-            destroy_op = random.choice(self.destroy_operators)
-            repair_op = random.choice(self.repair_operators)
-            
-            destroyed, removed = self._apply_destroy(solution, destroy_op)
-            repaired = self._apply_repair(destroyed, removed, repair_op)
-            
-            new_cost = self.calc.compute_transportation_cost(repaired)
-            
-            if new_cost < current_cost or random.random() < math.exp(-(new_cost - current_cost) / temperature):
+        current = self._solution_score(solution)
+        best = solution.copy()
+        best_cost = current
+        T = self.params["initial_temperature"]
+        it, noimp = 0, 0
+        while it < self.params["max_iterations"]:
+            it += 1
+            d_op = random.choice(["random", "worst", "shaw"])
+            r_op = random.choice(["greedy", "regret"])
+            destroyed, removed = self._destroy(solution, d_op)
+            repaired = self._repair(destroyed, removed, r_op)
+            new_cost = self._solution_score(repaired)
+            if new_cost < current or random.random() < math.exp(
+                    -(new_cost - current) / max(T, 1e-10)):
                 solution = repaired
-                current_cost = new_cost
+                current = new_cost
                 if new_cost < best_cost:
-                    best_solution = solution.copy()
+                    best = solution.copy()
                     best_cost = new_cost
-                    best_metrics = self.calc.compute_all_metrics(best_solution, iterations_to_convergence=iterations)
-                    no_improvement = 0
+                    noimp = 0
                 else:
-                    no_improvement += 1
+                    noimp += 1
             else:
-                no_improvement += 1
-            
-            temperature *= self.params['cooling_rate']
+                noimp += 1
+            T *= self.params["cooling_rate"]
             self.convergence_history.append(best_cost)
-            
-            if no_improvement > self.params['max_no_improvement']:
+            if noimp > self.params["max_no_improvement"]:
                 break
-        
-        best_metrics = self.calc.compute_all_metrics(best_solution, iterations_to_convergence=iterations)
-        best_metrics.cpu_time = time.time() - start_time
-        best_metrics.milp_calls = self.milp_calls
-        best_metrics.cache_hit_rate = (self.cache_hits / max(1, self.milp_calls + self.cache_hits)) * 100
-        best_metrics.iterations_to_convergence = iterations
-        
-        return best_solution, best_cost, {'metrics': best_metrics, 'convergence': self.convergence_history}
-    
-    def _apply_destroy(self, solution: Dict[int, List[int]], operator: str) -> Tuple[Dict[int, List[int]], List[int]]:
-        if operator == 'random':
-            return self._destroy_random(solution)
-        elif operator == 'worst':
-            return self._destroy_worst(solution)
-        else:
-            return self._destroy_shaw(solution)
-    
-    def _destroy_random(self, solution: Dict[int, List[int]]) -> Tuple[Dict[int, List[int]], List[int]]:
-        new_solution = {k: v.copy() for k, v in solution.items()}
-        all_customers = [c for route in new_solution.values() for c in route]
-        n_remove = max(2, int(len(all_customers) * self.params['destruction_rate']))
-        
-        if len(all_customers) > n_remove:
-            to_remove = set(random.sample(all_customers, n_remove))
-            removed = list(to_remove)
-            for vid in list(new_solution.keys()):
-                new_solution[vid] = [c for c in new_solution[vid] if c not in to_remove]
-                if not new_solution[vid]:
-                    del new_solution[vid]
-            return new_solution, removed
-        return new_solution, []
-    
-    def _destroy_worst(self, solution: Dict[int, List[int]]) -> Tuple[Dict[int, List[int]], List[int]]:
-        new_solution = {k: v.copy() for k, v in solution.items()}
-        marginal_costs = {}
-        for vid, route in new_solution.items():
-            if len(route) <= 1:
+        wall_clock = time.time() - t0
+        return best, best_cost, {"metrics": self._finalize(best, it, wall_clock),
+                                 "convergence": self.convergence_history}
+
+    def _solution_score(self, solution):
+        if not self._is_complete(solution):
+            return 1e9
+        travel = self.calc.compute_transportation_cost(solution)
+        total_pen = 0.0
+        for route in solution.values():
+            if not route:
                 continue
-            for idx, customer in enumerate(route):
-                route_without = route[:idx] + route[idx+1:]
-                if route_without:
-                    cost_with = self.calc.compute_transportation_cost({vid: route})
-                    cost_without = self.calc.compute_transportation_cost({vid: route_without})
-                    marginal_costs[(vid, customer)] = cost_with - cost_without
-        
-        if marginal_costs:
-            n_remove = max(2, int(len(marginal_costs) * self.params['destruction_rate'] * 0.8))
-            sorted_customers = sorted(marginal_costs.items(), key=lambda x: x[1], reverse=True)
-            to_remove = {item[0] for item in sorted_customers[:n_remove]}
+            pen, hard = self._route_penalty(route)
+            if hard:
+                return 1e9
+            total_pen += pen
+        return travel + (self.lambda_W + self.lambda_S) * total_pen
+
+    def _destroy(self, solution, op):
+        new = {k: v.copy() for k, v in solution.items()}
+        all_c = [c for r in new.values() for c in r]
+
+        if op == "random":
+            n_remove = max(2, int(len(all_c) * self.params["destruction_rate"]))
+            if len(all_c) <= n_remove:
+                return new, []
+            to_remove = set(random.sample(all_c, n_remove))
+            removed = list(to_remove)
+            for vid in list(new.keys()):
+                new[vid] = [c for c in new[vid] if c not in to_remove]
+                if not new[vid]:
+                    del new[vid]
+            return new, removed
+
+        if op == "worst":
+            marginal = {}
+            for vid, route in new.items():
+                if len(route) <= 1:
+                    continue
+                for i, c in enumerate(route):
+                    rw = route[:i] + route[i + 1:]
+                    if rw:
+                        marginal[(vid, c)] = (
+                            self.calc.compute_transportation_cost({vid: route})
+                            - self.calc.compute_transportation_cost({vid: rw})
+                        )
+            if not marginal:
+                return new, []
+            k = max(2, int(len(marginal) * self.params["destruction_rate"] * 0.8))
+            kept = sorted(marginal.items(), key=lambda x: x[1], reverse=True)[:k]
+            to_remove = {key for key, _ in kept}
             removed = [c for _, c in to_remove]
-            for vid in list(new_solution.keys()):
-                new_solution[vid] = [c for c in new_solution[vid] if (vid, c) not in to_remove]
-                if not new_solution[vid]:
-                    del new_solution[vid]
-            return new_solution, removed
-        return new_solution, []
-    
-    def _destroy_shaw(self, solution: Dict[int, List[int]]) -> Tuple[Dict[int, List[int]], List[int]]:
-        new_solution = {k: v.copy() for k, v in solution.items()}
-        all_customers = [c for route in new_solution.values() for c in route]
-        
-        if len(all_customers) < 3:
-            return self._destroy_random(solution)
-        
-        seed = random.choice(all_customers)
-        seed_demand = set(self.instance_data['customers'][seed]['demand'].keys())
-        
+            for vid in list(new.keys()):
+                new[vid] = [c for c in new[vid] if (vid, c) not in to_remove]
+                if not new[vid]:
+                    del new[vid]
+            return new, removed
+
+        if len(all_c) < 3:
+            return self._destroy(solution, "random")
+        seed = random.choice(all_c)
+        sp = set(self.instance_data["customers"][seed]["demand"].keys())
         similar = []
-        for customer in all_customers:
-            if customer == seed:
+        for c in all_c:
+            if c == seed:
                 continue
-            customer_demand = set(self.instance_data['customers'][customer]['demand'].keys())
-            overlap = len(seed_demand.intersection(customer_demand))
-            if overlap > 0:
-                similar.append((customer, overlap))
-        
+            ov = len(sp.intersection(
+                set(self.instance_data["customers"][c]["demand"].keys())))
+            if ov > 0:
+                similar.append((c, ov))
+        if not similar:
+            return self._destroy(solution, "random")
         similar.sort(key=lambda x: x[1], reverse=True)
-        n_remove = max(2, min(len(similar), int(len(all_customers) * self.params['destruction_rate'] * 0.7)))
-        
-        if similar:
-            to_remove = {seed} | {c for c, _ in similar[:n_remove]}
-            removed = list(to_remove)
-            for vid in list(new_solution.keys()):
-                new_solution[vid] = [c for c in new_solution[vid] if c not in to_remove]
-                if not new_solution[vid]:
-                    del new_solution[vid]
-            return new_solution, removed
-        return new_solution, []
-    
-    def _apply_repair(self, solution: Dict[int, List[int]], unassigned: List[int], operator: str) -> Dict[int, List[int]]:
-        if operator == 'greedy':
-            return self._repair_greedy(solution, unassigned)
-        else:
-            return self._repair_regret(solution, unassigned)
-    
-    def _repair_greedy(self, solution: Dict[int, List[int]], unassigned: List[int]) -> Dict[int, List[int]]:
-        new_solution = {k: v.copy() for k, v in solution.items()}
+        k = max(2, min(len(similar),
+                       int(len(all_c) * self.params["destruction_rate"] * 0.7)))
+        to_remove = {seed} | {c for c, _ in similar[:k]}
+        removed = list(to_remove)
+        for vid in list(new.keys()):
+            new[vid] = [c for c in new[vid] if c not in to_remove]
+            if not new[vid]:
+                del new[vid]
+        return new, removed
+
+    def _repair(self, solution, unassigned, op):
+        new = {k: v.copy() for k, v in solution.items()}
         remaining = unassigned[:]
         random.shuffle(remaining)
-        
-        for customer in remaining[:]:
-            best_vid = None
-            best_pos = None
-            best_cost = float('inf')
-            
-            for vid, route in new_solution.items():
+        for c in remaining[:]:
+            best_vid, best_pos, best_score = None, None, float("inf")
+            for vid, route in new.items():
                 for pos in range(len(route) + 1):
-                    new_route = route[:pos] + [customer] + route[pos:]
-                    if self._is_route_feasible(new_route):
-                        cost = self.calc.compute_transportation_cost({vid: new_route})
-                        if cost < best_cost:
-                            best_cost = cost
-                            best_vid = vid
-                            best_pos = pos
-            
+                    test = route[:pos] + [c] + route[pos:]
+                    pen, hard = self._route_penalty(test)
+                    if hard:
+                        continue
+                    score = (self.calc.compute_transportation_cost({vid: test})
+                             + (self.lambda_W + self.lambda_S) * pen)
+                    if score < best_score:
+                        best_score, best_vid, best_pos = score, vid, pos
             if best_vid is not None:
-                new_solution[best_vid].insert(best_pos, customer)
-                remaining.remove(customer)
-        
-        for customer in remaining:
-            if self._is_route_feasible([customer]):
-                new_solution[len(new_solution)] = [customer]
-            else:
-                new_solution[len(new_solution)] = [customer]
-        
-        return new_solution
-    
-    def _repair_regret(self, solution: Dict[int, List[int]], unassigned: List[int]) -> Dict[int, List[int]]:
-        new_solution = {k: v.copy() for k, v in solution.items()}
-        remaining = unassigned[:]
-        
-        while remaining:
-            regrets = []
-            for customer in remaining:
-                costs = []
-                for vid, route in new_solution.items():
-                    for pos in range(len(route) + 1):
-                        new_route = route[:pos] + [customer] + route[pos:]
-                        if self._is_route_feasible(new_route):
-                            costs.append(self.calc.compute_transportation_cost({vid: new_route}))
-                
-                if len(costs) >= 2:
-                    costs.sort()
-                    regret = costs[1] - costs[0]
-                elif costs:
-                    regret = costs[0]
-                else:
-                    regret = float('inf')
-                regrets.append((regret, customer))
-            
-            if not regrets:
-                break
-            
-            regrets.sort(key=lambda x: x[0], reverse=True)
-            if regrets[0][0] == float('inf'):
-                customer = remaining.pop(0)
-                new_solution[len(new_solution)] = [customer]
-                continue
-            
-            customer = regrets[0][1]
-            best_vid = None
-            best_pos = None
-            best_cost = float('inf')
-            
-            for vid, route in new_solution.items():
-                for pos in range(len(route) + 1):
-                    new_route = route[:pos] + [customer] + route[pos:]
-                    if self._is_route_feasible(new_route):
-                        cost = self.calc.compute_transportation_cost({vid: new_route})
-                        if cost < best_cost:
-                            best_cost = cost
-                            best_vid = vid
-                            best_pos = pos
-            
-            if best_vid is not None:
-                new_solution[best_vid].insert(best_pos, customer)
-                remaining.remove(customer)
-            else:
-                new_solution[len(new_solution)] = [customer]
-                remaining.remove(customer)
-        
-        return new_solution
+                new[best_vid].insert(best_pos, c)
+                remaining.remove(c)
+        for c in remaining:
+            new[len(new)] = [c]
+        return new
 
 
 # ============================================================================
-# ALGORITHM 2: FDAHS (FIXED)
+# FDAHS / GCOF / HSA / ACO-2opt
 # ============================================================================
 
 class FDAHSAlgorithm(BaseAlgorithm):
-    def __init__(self, instance_data: Dict, vehicle: Vehicle, params: Dict = None):
-        super().__init__(instance_data, vehicle)
-        self.params = params or {
-            'max_iterations': 150,
-            'population_size': 20,
-            'crossover_rate': 0.8,
-            'mutation_rate': 0.1,
-            'com_penalty_weight': 0.5,
-            'max_no_improvement': 50
-        }
-        
-    def solve(self) -> Tuple[Dict[int, List[int]], float, Dict]:
-        start_time = time.time()
-        
-        population = []
-        for _ in range(self.params['population_size']):
-            solution = self._generate_initial_solution()
-            solution = self._two_opt_improvement(solution)
-            population.append(solution)
-        
-        costs = [self.calc.compute_transportation_cost(sol) for sol in population]
-        best_idx = np.argmin(costs)
-        best_solution = population[best_idx].copy()
-        best_cost = costs[best_idx]
-        best_metrics = self.calc.compute_all_metrics(best_solution, iterations_to_convergence=0)
-        
-        no_improvement = 0
-        iterations = 0
-        
-        while iterations < self.params['max_iterations']:
-            iterations += 1
-            
-            new_population = []
-            
-            for _ in range(self.params['population_size']):
-                if random.random() < self.params['crossover_rate']:
-                    p1 = self._tournament_select(population, costs)
-                    p2 = self._tournament_select(population, costs)
-                    child = self._crossover(p1, p2)
-                else:
-                    child = random.choice(population).copy()
-                
-                if random.random() < self.params['mutation_rate']:
+    def __init__(self, instance_data, vehicle, params=None, stability_weight=0.35):
+        super().__init__(instance_data, vehicle, stability_weight=stability_weight)
+        self.params = params or {"max_iterations": 60, "population_size": 10,
+                                 "crossover_rate": 0.8, "mutation_rate": 0.1,
+                                 "max_no_improvement": 25}
+
+    def solve(self):
+        t0 = time.time()
+        pop = []
+        for _ in range(self.params["population_size"]):
+            s = self._two_opt_improvement(self._generate_initial_solution())
+            pop.append(s)
+        costs = [self._solution_score(s) for s in pop]
+        bi = int(np.argmin(costs))
+        best, best_cost = pop[bi].copy(), costs[bi]
+        it, noimp = 0, 0
+        while it < self.params["max_iterations"]:
+            it += 1
+            new_pop = []
+            for _ in range(self.params["population_size"]):
+                p1 = random.choice(pop)
+                p2 = random.choice(pop)
+                child = self._crossover(p1, p2)
+                if random.random() < self.params["mutation_rate"]:
                     child = self._mutate(child)
-                
                 child = self._two_opt_improvement(child)
-                child = self._com_aware_repair(child)
-                new_population.append(child)
-            
-            population = new_population
-            costs = [self.calc.compute_transportation_cost(sol) for sol in population]
-            
-            current_best_idx = np.argmin(costs)
-            if costs[current_best_idx] < best_cost:
-                best_solution = population[current_best_idx].copy()
-                best_cost = costs[current_best_idx]
-                best_metrics = self.calc.compute_all_metrics(best_solution, iterations_to_convergence=iterations)
-                no_improvement = 0
+                new_pop.append(child)
+            pop = new_pop
+            costs = [self._solution_score(s) for s in pop]
+            bi = int(np.argmin(costs))
+            if costs[bi] < best_cost - 1e-9:
+                best, best_cost = pop[bi].copy(), costs[bi]
+                noimp = 0
             else:
-                no_improvement += 1
-            
+                noimp += 1
             self.convergence_history.append(best_cost)
-            
-            if no_improvement > self.params['max_no_improvement']:
+            if noimp > self.params["max_no_improvement"]:
                 break
-        
-        best_metrics = self.calc.compute_all_metrics(best_solution, iterations_to_convergence=iterations)
-        best_metrics.cpu_time = time.time() - start_time
-        best_metrics.milp_calls = self.milp_calls
-        best_metrics.cache_hit_rate = (self.cache_hits / max(1, self.milp_calls + self.cache_hits)) * 100
-        best_metrics.iterations_to_convergence = iterations
-        
-        return best_solution, best_cost, {'metrics': best_metrics, 'convergence': self.convergence_history}
-    
-    def _tournament_select(self, population: List, costs: List, tournament_size: int = 3) -> Dict:
-        indices = random.sample(range(len(population)), tournament_size)
-        best_idx = min(indices, key=lambda i: costs[i])
-        return population[best_idx].copy()
-    
-    def _crossover(self, p1: Dict, p2: Dict) -> Dict:
-        p1_customers = [c for route in p1.values() for c in route]
-        p2_customers = [c for route in p2.values() for c in route]
-        
-        if len(p1_customers) < 2:
-            return p1.copy()
-        
-        idx1 = random.randint(0, len(p1_customers) - 2)
-        idx2 = random.randint(idx1 + 1, len(p1_customers) - 1)
-        
-        child_customers = [None] * len(p1_customers)
-        child_customers[idx1:idx2] = p1_customers[idx1:idx2]
-        
-        p2_idx = 0
-        for i in range(len(child_customers)):
-            if child_customers[i] is None:
-                while p2_customers[p2_idx] in child_customers:
-                    p2_idx += 1
-                child_customers[i] = p2_customers[p2_idx]
-                p2_idx += 1
-        
-        child = {}
-        for customer in child_customers:
-            inserted = False
-            for vid, route in child.items():
-                test_route = route + [customer]
-                if self._is_route_feasible(test_route):
-                    child[vid].append(customer)
-                    inserted = True
-                    break
-            if not inserted:
-                child[len(child)] = [customer]
-        
-        return child
-    
-    def _mutate(self, solution: Dict) -> Dict:
-        new_solution = {k: v.copy() for k, v in solution.items()}
-        routes = list(new_solution.keys())
-        
-        if len(routes) < 2:
-            return new_solution
-        
-        vid1, vid2 = random.sample(routes, 2)
-        route1 = new_solution[vid1]
-        route2 = new_solution[vid2]
-        
-        if not route1 or not route2:
-            return new_solution
-        
-        idx1 = random.randint(0, len(route1) - 1)
-        idx2 = random.randint(0, len(route2) - 1)
-        
-        c1 = route1[idx1]
-        c2 = route2[idx2]
-        
-        new_route1 = route1[:idx1] + [c2] + route1[idx1+1:]
-        new_route2 = route2[:idx2] + [c1] + route2[idx2+1:]
-        
-        if self._is_route_feasible(new_route1) and self._is_route_feasible(new_route2):
-            new_solution[vid1] = new_route1
-            new_solution[vid2] = new_route2
-        
-        return new_solution
-    
-    def _com_aware_repair(self, solution: Dict) -> Dict:
-        new_solution = {k: v.copy() for k, v in solution.items()}
-        
-        for vid in list(new_solution.keys()):
-            route = new_solution[vid]
+        wall_clock = time.time() - t0
+        return best, best_cost, {"metrics": self._finalize(best, it, wall_clock)}
+
+    def _solution_score(self, solution):
+        if not self._is_complete(solution):
+            return 1e9
+        travel = self.calc.compute_transportation_cost(solution)
+        total_pen = 0.0
+        for route in solution.values():
             if not route:
                 continue
-            
-            demands = self._extract_demands(route)
-            feasible, _ = self.saca.solve_heuristic(demands, self.vehicle.product_densities)
-            
-            if not feasible and len(route) > 1:
-                best_split = None
-                best_cost = float('inf')
-                
-                for i in range(1, len(route)):
-                    route1 = route[:i]
-                    route2 = route[i:]
-                    demands1 = self._extract_demands(route1)
-                    demands2 = self._extract_demands(route2)
-                    feasible1, _ = self.saca.solve_heuristic(demands1, self.vehicle.product_densities)
-                    feasible2, _ = self.saca.solve_heuristic(demands2, self.vehicle.product_densities)
-                    
-                    if feasible1 and feasible2:
-                        cost = self.calc.compute_transportation_cost({0: route1, 1: route2})
-                        if cost < best_cost:
-                            best_cost = cost
-                            best_split = [route1, route2]
-                
-                if best_split:
-                    del new_solution[vid]
-                    new_solution[len(new_solution)] = best_split[0]
-                    new_solution[len(new_solution)] = best_split[1]
-        
-        return new_solution
+            pen, hard = self._route_penalty(route)
+            if hard:
+                return 1e9
+            total_pen += pen
+        return travel + (self.lambda_W + self.lambda_S) * total_pen
 
+    def _crossover(self, p1, p2):
+        c1 = [c for r in p1.values() for c in r]
+        c2 = [c for r in p2.values() for c in r]
+        if len(c1) < 2:
+            return {k: v.copy() for k, v in p1.items()}
+        i = random.randint(0, len(c1) - 2)
+        j = random.randint(i + 1, len(c1) - 1)
+        seq = [None] * len(c1)
+        seq[i:j] = c1[i:j]
+        j2 = 0
+        for k in range(len(seq)):
+            if seq[k] is None:
+                while j2 < len(c2) and c2[j2] in seq:
+                    j2 += 1
+                if j2 < len(c2):
+                    seq[k] = c2[j2]
+                    j2 += 1
+        child = {}
+        for c in seq:
+            if c is None:
+                continue
+            placed = False
+            for vid, route in child.items():
+                test = route + [c]
+                pen, hard = self._route_penalty(test)
+                if not hard:
+                    child[vid].append(c)
+                    placed = True
+                    break
+            if not placed:
+                child[len(child)] = [c]
+        return child
 
-# ============================================================================
-# ALGORITHM 3: GCOF 
-# ============================================================================
+    def _mutate(self, solution):
+        new = {k: v.copy() for k, v in solution.items()}
+        routes = list(new.keys())
+        if len(routes) < 2:
+            return new
+        v1, v2 = random.sample(routes, 2)
+        r1, r2 = new[v1], new[v2]
+        if not r1 or not r2:
+            return new
+        i1 = random.randint(0, len(r1) - 1)
+        i2 = random.randint(0, len(r2) - 1)
+        nr1 = r1[:i1] + [r2[i2]] + r1[i1 + 1:]
+        nr2 = r2[:i2] + [r1[i1]] + r2[i2 + 1:]
+        pen1, hard1 = self._route_penalty(nr1)
+        pen2, hard2 = self._route_penalty(nr2)
+        if not hard1 and not hard2:
+            new[v1], new[v2] = nr1, nr2
+        return new
+
 
 class GCOFAlgorithm(BaseAlgorithm):
-    def __init__(self, instance_data: Dict, vehicle: Vehicle, params: Dict = None):
-        super().__init__(instance_data, vehicle)
-        self.params = params or {
-            'max_iterations': 150,
-            'population_size': 20,
-            'white_shark_alpha': 0.5,
-            'white_shark_beta': 0.8,
-            'cgpa_threshold': 0.1,
-            'max_no_improvement': 50
-        }
-        
-    def solve(self) -> Tuple[Dict[int, List[int]], float, Dict]:
-        start_time = time.time()
-        
-        population = []
-        for _ in range(self.params['population_size']):
-            solution = self._generate_initial_solution()
-            solution = self._two_opt_improvement(solution)
-            population.append(solution)
-        
-        costs = [self.calc.compute_transportation_cost(sol) for sol in population]
-        best_idx = np.argmin(costs)
-        best_solution = population[best_idx].copy()
-        best_cost = costs[best_idx]
-        best_metrics = self.calc.compute_all_metrics(best_solution, iterations_to_convergence=0)
-        
-        no_improvement = 0
-        
-        for iteration in range(self.params['max_iterations']):
-            new_population = []
-            
-            for i, solution in enumerate(population):
-                guided_solution = self._white_shark_update(solution, population, costs, i)
-                guided_solution = self._cgpa_adjustment(guided_solution)
-                guided_solution = self._hldcps_packing(guided_solution)
-                guided_solution = self._two_opt_improvement(guided_solution)
-                new_population.append(guided_solution)
-            
-            population = new_population
-            costs = [self.calc.compute_transportation_cost(sol) for sol in population]
-            
-            current_best_idx = np.argmin(costs)
-            if costs[current_best_idx] < best_cost:
-                best_solution = population[current_best_idx].copy()
-                best_cost = costs[current_best_idx]
-                best_metrics = self.calc.compute_all_metrics(best_solution, iterations_to_convergence=iteration + 1)
-                no_improvement = 0
+    def __init__(self, instance_data, vehicle, params=None, stability_weight=0.35):
+        super().__init__(instance_data, vehicle, stability_weight=stability_weight)
+        self.params = params or {"max_iterations": 60, "population_size": 10,
+                                 "max_no_improvement": 25}
+
+    def solve(self):
+        t0 = time.time()
+        pop = []
+        for _ in range(self.params["population_size"]):
+            s = self._two_opt_improvement(self._generate_initial_solution())
+            pop.append(s)
+        costs = [self._solution_score(s) for s in pop]
+        bi = int(np.argmin(costs))
+        best, best_cost = pop[bi].copy(), costs[bi]
+        it, noimp = 0, 0
+        while it < self.params["max_iterations"]:
+            it += 1
+            new_pop = []
+            for sol in pop:
+                g = {k: v.copy() for k, v in sol.items()}
+                if random.random() < 0.3:
+                    other = random.choice(pop)
+                    g = self._cgpa_adjust(g, other)
+                g = self._two_opt_improvement(g)
+                new_pop.append(g)
+            pop = new_pop
+            costs = [self._solution_score(s) for s in pop]
+            bi = int(np.argmin(costs))
+            if costs[bi] < best_cost - 1e-9:
+                best, best_cost = pop[bi].copy(), costs[bi]
+                noimp = 0
             else:
-                no_improvement += 1
-            
+                noimp += 1
             self.convergence_history.append(best_cost)
-            
-            if no_improvement > self.params['max_no_improvement']:
+            if noimp > self.params["max_no_improvement"]:
                 break
-        
-        best_metrics = self.calc.compute_all_metrics(best_solution, iterations_to_convergence=iteration + 1)
-        best_metrics.cpu_time = time.time() - start_time
-        best_metrics.milp_calls = self.milp_calls
-        best_metrics.cache_hit_rate = (self.cache_hits / max(1, self.milp_calls + self.cache_hits)) * 100
-        best_metrics.iterations_to_convergence = iteration + 1
-        
-        return best_solution, best_cost, {'metrics': best_metrics, 'convergence': self.convergence_history}
-    
-    def _white_shark_update(self, solution: Dict, population: List, costs: List, idx: int) -> Dict:
-        new_solution = {k: v.copy() for k, v in solution.items()}
-        
-        others = [j for j in range(len(population)) if j != idx]
-        if len(others) >= 2:
-            a, b = random.sample(others, 2)
-            if costs[a] < costs[b]:
-                guide_sol = population[a]
-            else:
-                guide_sol = population[b]
-            
-            if random.random() < self.params['white_shark_alpha']:
-                routes_a = list(new_solution.values())
-                routes_b = list(guide_sol.values())
-                
-                if routes_a and routes_b:
-                    idx_a = random.randint(0, len(routes_a) - 1)
-                    idx_b = random.randint(0, len(routes_b) - 1)
-                    
-                    route_a = routes_a[idx_a]
-                    route_b = routes_b[idx_b]
-                    
-                    for c1 in route_a[:]:
-                        for c2 in route_b[:]:
-                            if random.random() < 0.1:
-                                test_solution = self._swap_customers(new_solution, c1, c2)
-                                new_solution = test_solution
-        
-        return new_solution
-    
-    def _swap_customers(self, solution: Dict, c1: int, c2: int) -> Dict:
-        new_solution = {k: v.copy() for k, v in solution.items()}
-        
-        vid1 = None
-        vid2 = None
-        for vid, route in new_solution.items():
-            if c1 in route:
-                vid1 = vid
-            if c2 in route:
-                vid2 = vid
-        
-        if vid1 is None or vid2 is None or vid1 == vid2:
-            return solution
-        
-        route1 = new_solution[vid1]
-        route2 = new_solution[vid2]
-        idx1 = route1.index(c1)
-        idx2 = route2.index(c2)
-        
-        new_route1 = route1[:idx1] + [c2] + route1[idx1+1:]
-        new_route2 = route2[:idx2] + [c1] + route2[idx2+1:]
-        
-        if self._is_route_feasible(new_route1) and self._is_route_feasible(new_route2):
-            new_solution[vid1] = new_route1
-            new_solution[vid2] = new_route2
-        
-        return new_solution
-    
-    def _cgpa_adjustment(self, solution: Dict) -> Dict:
-        new_solution = {k: v.copy() for k, v in solution.items()}
-        
-        for vid, route in new_solution.items():
+        wall_clock = time.time() - t0
+        return best, best_cost, {"metrics": self._finalize(best, it, wall_clock)}
+
+    def _solution_score(self, solution):
+        if not self._is_complete(solution):
+            return 1e9
+        travel = self.calc.compute_transportation_cost(solution)
+        total_pen = 0.0
+        for route in solution.values():
+            if not route:
+                continue
+            pen, hard = self._route_penalty(route)
+            if hard:
+                return 1e9
+            total_pen += pen
+        return travel + (self.lambda_W + self.lambda_S) * total_pen
+
+    def _cgpa_adjust(self, sol, other):
+        new = {k: v.copy() for k, v in sol.items()}
+        for vid, route in new.items():
             if len(route) <= 1:
                 continue
-            
-            stability = self.calc.compute_stability_margin({vid: route})
-            
-            if stability < self.params['cgpa_threshold'] * 100:
-                best_route = route
-                best_stability = stability
-                
-                for i in range(len(route) - 1):
-                    for j in range(i + 1, len(route)):
-                        test_route = route[:i] + route[j:j+1] + route[i:j] + route[j+1:]
-                        if self._is_route_feasible(test_route):
-                            test_stability = self.calc.compute_stability_margin({vid: test_route})
-                            if test_stability > best_stability:
-                                best_stability = test_stability
-                                best_route = test_route
-                
-                new_solution[vid] = best_route
-        
-        return new_solution
-    
-    def _hldcps_packing(self, solution: Dict) -> Dict:
-        new_solution = {k: v.copy() for k, v in solution.items()}
-        
-        for vid in list(new_solution.keys()):
-            route = new_solution[vid]
-            if len(route) <= 1:
-                continue
-            
-            demands = self._extract_demands(route)
-            feasible, _ = self.saca.solve_heuristic(demands, self.vehicle.product_densities)
-            
-            if not feasible and len(route) > 1:
-                best_split = None
-                best_cost = float('inf')
-                
-                for i in range(1, len(route)):
-                    route1 = route[:i]
-                    route2 = route[i:]
-                    demands1 = self._extract_demands(route1)
-                    demands2 = self._extract_demands(route2)
-                    feasible1, _ = self.saca.solve_heuristic(demands1, self.vehicle.product_densities)
-                    feasible2, _ = self.saca.solve_heuristic(demands2, self.vehicle.product_densities)
-                    
-                    if feasible1 and feasible2:
-                        cost = self.calc.compute_transportation_cost({0: route1, 1: route2})
-                        if cost < best_cost:
-                            best_cost = cost
-                            best_split = [route1, route2]
-                
-                if best_split:
-                    del new_solution[vid]
-                    new_solution[len(new_solution)] = best_split[0]
-                    new_solution[len(new_solution)] = best_split[1]
-        
-        return new_solution
+            for i in range(len(route) - 1):
+                for j in range(i + 1, len(route)):
+                    test = route[:i] + route[j:j + 1] + route[i:j] + route[j + 1:]
+                    pen, hard = self._route_penalty(test)
+                    if hard:
+                        continue
+                    cur_score = (self.calc.compute_transportation_cost({vid: route})
+                                 + (self.lambda_W + self.lambda_S) *
+                                 self._route_penalty(route)[0])
+                    new_score = (self.calc.compute_transportation_cost({vid: test})
+                                 + (self.lambda_W + self.lambda_S) * pen)
+                    if new_score < cur_score:
+                        new[vid] = test
+                        break
+        return new
 
-
-# ============================================================================
-# ALGORITHM 4: HSA 
-# ============================================================================
 
 class HSAAlgorithm(BaseAlgorithm):
-    def __init__(self, instance_data: Dict, vehicle: Vehicle, params: Dict = None):
-        super().__init__(instance_data, vehicle)
-        self.params = params or {
-            'max_iterations': 150,
-            'initial_temperature': 40.0,
-            'cooling_rate': 0.98,
-            'final_temperature': 0.001,
-            'local_search_frequency': 5,
-            'max_no_improvement': 50
-        }
-        
-    def solve(self) -> Tuple[Dict[int, List[int]], float, Dict]:
-        start_time = time.time()
-        
-        solution = self._generate_initial_solution()
-        solution = self._two_opt_improvement(solution)
-        current_cost = self.calc.compute_transportation_cost(solution)
-        best_solution = solution.copy()
-        best_cost = current_cost
-        best_metrics = self.calc.compute_all_metrics(best_solution, iterations_to_convergence=0)
-        
-        temperature = self.params['initial_temperature']
-        iterations = 0
-        no_improvement = 0
-        
-        while temperature > self.params['final_temperature'] and iterations < self.params['max_iterations']:
-            iterations += 1
-            
-            neighbor = self._generate_neighbor(solution)
-            neighbor_cost = self.calc.compute_transportation_cost(neighbor)
-            
-            if no_improvement > 20:
-                temp_factor = 0.95
-            else:
-                temp_factor = self.params['cooling_rate']
-            
-            if neighbor_cost < current_cost or random.random() < math.exp(-(neighbor_cost - current_cost) / temperature):
-                solution = neighbor
-                current_cost = neighbor_cost
-                
-                if current_cost < best_cost:
-                    best_solution = solution.copy()
-                    best_cost = current_cost
-                    best_metrics = self.calc.compute_all_metrics(best_solution, iterations_to_convergence=iterations)
-                    no_improvement = 0
+    def __init__(self, instance_data, vehicle, params=None, stability_weight=0.35):
+        super().__init__(instance_data, vehicle, stability_weight=stability_weight)
+        self.params = params or {"max_iterations": 60,
+                                 "initial_temperature": 40.0,
+                                 "cooling_rate": 0.98, "max_no_improvement": 25}
+
+    def solve(self):
+        t0 = time.time()
+        solution = self._two_opt_improvement(self._generate_initial_solution())
+        current = self._solution_score(solution)
+        best, best_cost = solution.copy(), current
+        T = self.params["initial_temperature"]
+        it, noimp = 0, 0
+        while T > 0.001 and it < self.params["max_iterations"]:
+            it += 1
+            nb = self._neighbor(solution)
+            nc = self._solution_score(nb)
+            if nc < current or random.random() < math.exp(-(nc - current) / max(T, 1e-10)):
+                solution = nb
+                current = nc
+                if nc < best_cost:
+                    best, best_cost = solution.copy(), nc
+                    noimp = 0
                 else:
-                    no_improvement += 1
+                    noimp += 1
             else:
-                no_improvement += 1
-            
-            if iterations % self.params['local_search_frequency'] == 0:
-                solution, current_cost = self._local_search(solution, current_cost)
-                if current_cost < best_cost:
-                    best_solution = solution.copy()
-                    best_cost = current_cost
-                    best_metrics = self.calc.compute_all_metrics(best_solution, iterations_to_convergence=iterations)
-            
-            temperature *= temp_factor
+                noimp += 1
+            T *= self.params["cooling_rate"]
             self.convergence_history.append(best_cost)
-            
-            if no_improvement > self.params['max_no_improvement']:
+            if noimp > self.params["max_no_improvement"]:
                 break
-        
-        best_metrics = self.calc.compute_all_metrics(best_solution, iterations_to_convergence=iterations)
-        best_metrics.cpu_time = time.time() - start_time
-        best_metrics.milp_calls = self.milp_calls
-        best_metrics.cache_hit_rate = (self.cache_hits / max(1, self.milp_calls + self.cache_hits)) * 100
-        best_metrics.iterations_to_convergence = iterations
-        
-        return best_solution, best_cost, {'metrics': best_metrics, 'convergence': self.convergence_history}
-    
-    def _generate_neighbor(self, solution: Dict[int, List[int]]) -> Dict[int, List[int]]:
-        operators = ['swap', 'relocate', '2opt']
-        op = random.choice(operators)
-        
-        if op == 'swap':
-            return self._swap_neighbor(solution)
-        elif op == 'relocate':
-            return self._relocate_neighbor(solution)
-        else:
-            return self._two_opt_neighbor(solution)
-    
-    def _swap_neighbor(self, solution: Dict) -> Dict:
-        new_solution = {k: v.copy() for k, v in solution.items()}
-        routes = list(new_solution.keys())
-        
-        if len(routes) < 2:
-            return new_solution
-        
-        vid1, vid2 = random.sample(routes, 2)
-        route1 = new_solution[vid1]
-        route2 = new_solution[vid2]
-        
-        if not route1 or not route2:
-            return new_solution
-        
-        idx1 = random.randint(0, len(route1) - 1)
-        idx2 = random.randint(0, len(route2) - 1)
-        
-        c1 = route1[idx1]
-        c2 = route2[idx2]
-        
-        new_route1 = route1[:idx1] + [c2] + route1[idx1+1:]
-        new_route2 = route2[:idx2] + [c1] + route2[idx2+1:]
-        
-        if self._is_route_feasible(new_route1) and self._is_route_feasible(new_route2):
-            new_solution[vid1] = new_route1
-            new_solution[vid2] = new_route2
-        
-        return new_solution
-    
-    def _relocate_neighbor(self, solution: Dict) -> Dict:
-        new_solution = {k: v.copy() for k, v in solution.items()}
-        routes = list(new_solution.keys())
-        
-        if len(routes) < 2:
-            return new_solution
-        
-        vid1, vid2 = random.sample(routes, 2)
-        route1 = new_solution[vid1]
-        route2 = new_solution[vid2]
-        
-        if not route1:
-            return new_solution
-        
-        idx1 = random.randint(0, len(route1) - 1)
-        c1 = route1[idx1]
-        
-        new_route1 = route1[:idx1] + route1[idx1+1:]
-        if not new_route1:
-            del new_solution[vid1]
-        else:
-            new_solution[vid1] = new_route1
-        
-        pos2 = random.randint(0, len(route2))
-        new_route2 = route2[:pos2] + [c1] + route2[pos2:]
-        
-        if self._is_route_feasible(new_route2):
-            new_solution[vid2] = new_route2
-        else:
-            new_solution[vid1] = route1
-            new_solution[vid2] = route2
-        
-        return new_solution
-    
-    def _two_opt_neighbor(self, solution: Dict) -> Dict:
-        new_solution = {k: v.copy() for k, v in solution.items()}
-        routes = list(new_solution.keys())
-        
-        if not routes:
-            return new_solution
-        
-        vid = random.choice(routes)
-        route = new_solution[vid]
-        
-        if len(route) < 3:
-            return new_solution
-        
-        i = random.randint(0, len(route) - 2)
-        j = random.randint(i + 1, len(route) - 1)
-        
-        new_route = route[:i] + route[i:j+1][::-1] + route[j+1:]
-        
-        if self._is_route_feasible(new_route):
-            new_solution[vid] = new_route
-        
-        return new_solution
-    
-    def _local_search(self, solution: Dict, cost: float) -> Tuple[Dict, float]:
-        improved = True
-        current_solution = solution.copy()
-        current_cost = cost
-        
-        while improved:
-            improved = False
-            
-            for vid in list(current_solution.keys()):
-                route = current_solution[vid]
-                if len(route) < 3:
-                    continue
-                for i in range(len(route) - 2):
-                    for j in range(i + 2, len(route)):
-                        new_route = route[:i] + route[i:j+1][::-1] + route[j+1:]
-                        if self._is_route_feasible(new_route):
-                            new_cost = self.calc.compute_transportation_cost({vid: new_route})
-                            if new_cost < current_cost:
-                                current_solution[vid] = new_route
-                                current_cost = new_cost
-                                improved = True
-                                break
-                    if improved:
-                        break
-                if improved:
-                    break
-        
-        return current_solution, current_cost
+        wall_clock = time.time() - t0
+        return best, best_cost, {"metrics": self._finalize(best, it, wall_clock)}
 
+    def _solution_score(self, solution):
+        if not self._is_complete(solution):
+            return 1e9
+        travel = self.calc.compute_transportation_cost(solution)
+        total_pen = 0.0
+        for route in solution.values():
+            if not route:
+                continue
+            pen, hard = self._route_penalty(route)
+            if hard:
+                return 1e9
+            total_pen += pen
+        return travel + (self.lambda_W + self.lambda_S) * total_pen
 
-# ============================================================================
-# ALGORITHM 5: ACO-2opt 
-# ============================================================================
+    def _neighbor(self, solution):
+        new = {k: v.copy() for k, v in solution.items()}
+        routes = list(new.keys())
+        if len(routes) < 2:
+            return new
+        v1, v2 = random.sample(routes, 2)
+        r1, r2 = new[v1], new[v2]
+        if not r1 or not r2:
+            return new
+        i1 = random.randint(0, len(r1) - 1)
+        i2 = random.randint(0, len(r2) - 1)
+        nr1 = r1[:i1] + [r2[i2]] + r1[i1 + 1:]
+        nr2 = r2[:i2] + [r1[i1]] + r2[i2 + 1:]
+        pen1, hard1 = self._route_penalty(nr1)
+        pen2, hard2 = self._route_penalty(nr2)
+        if not hard1 and not hard2:
+            new[v1], new[v2] = nr1, nr2
+        return new
+
 
 class ACO2optAlgorithm(BaseAlgorithm):
-    def __init__(self, instance_data: Dict, vehicle: Vehicle, params: Dict = None):
-        super().__init__(instance_data, vehicle)
-        self.params = params or {
-            'max_iterations': 150,
-            'num_ants': 20,
-            'alpha': 1.0,
-            'beta': 2.0,
-            'rho': 0.9,
-            'q0': 0.9,
-            'max_no_improvement': 50
-        }
+    def __init__(self, instance_data, vehicle, params=None, stability_weight=0.35):
+        super().__init__(instance_data, vehicle, stability_weight=stability_weight)
+        self.params = params or {"max_iterations": 60, "num_ants": 10,
+                                 "alpha": 1.0, "beta": 2.0, "rho": 0.9,
+                                 "max_no_improvement": 25}
         self.pheromone = None
-        
-    def solve(self) -> Tuple[Dict[int, List[int]], float, Dict]:
-        start_time = time.time()
-        
-        n_customers = self.n_customers
-        self.pheromone = np.ones((n_customers + 1, n_customers + 1))
-        
-        best_solution = None
-        best_cost = float('inf')
-        best_metrics = None
-        no_improvement = 0
-        
-        for iteration in range(self.params['max_iterations']):
-            solutions = []
-            costs = []
-            
-            for ant in range(self.params['num_ants']):
-                solution = self._ant_construction()
-                solution = self._two_opt_improvement(solution)
-                cost = self.calc.compute_transportation_cost(solution)
-                solutions.append(solution)
-                costs.append(cost)
-                
-                if cost < best_cost:
-                    best_cost = cost
-                    best_solution = solution.copy()
-                    best_metrics = self.calc.compute_all_metrics(best_solution, iterations_to_convergence=iteration + 1)
-                    no_improvement = 0
+
+    def solve(self):
+        t0 = time.time()
+        n = self.n_customers
+        self.pheromone = np.full((n + 1, n + 1), 1.0 / (n + 1))
+        best = self._two_opt_improvement(self._generate_initial_solution())
+        best_cost = self._solution_score(best)
+        it, noimp = 0, 0
+        for it in range(self.params["max_iterations"]):
+            sols, costs = [], []
+            for _ in range(self.params["num_ants"]):
+                s = self._ant_construct()
+                s = self._two_opt_improvement(s)
+                c = self._solution_score(s)
+                sols.append(s)
+                costs.append(c)
+                if c < best_cost:
+                    best, best_cost = s.copy(), c
+                    noimp = 0
                 else:
-                    no_improvement += 1
-            
-            self._update_pheromone(solutions, costs)
-            self.pheromone *= (1 - self.params['rho'])
-            
+                    noimp += 1
+            self._update_pheromone(sols, costs)
+            self.pheromone *= (1 - self.params["rho"])
+            self.pheromone += 1e-9
             self.convergence_history.append(best_cost)
-            
-            if no_improvement > self.params['max_no_improvement']:
+            if noimp > self.params["max_no_improvement"]:
                 break
-        
-        best_metrics = self.calc.compute_all_metrics(best_solution, iterations_to_convergence=iteration + 1)
-        best_metrics.cpu_time = time.time() - start_time
-        best_metrics.milp_calls = self.milp_calls
-        best_metrics.cache_hit_rate = (self.cache_hits / max(1, self.milp_calls + self.cache_hits)) * 100
-        best_metrics.iterations_to_convergence = iteration + 1
-        
-        return best_solution, best_cost, {'metrics': best_metrics, 'convergence': self.convergence_history}
-    
-    def _ant_construction(self) -> Dict[int, List[int]]:
-        unassigned = list(range(self.n_customers))
-        random.shuffle(unassigned)
+        wall_clock = time.time() - t0
+        return best, best_cost, {"metrics": self._finalize(best, it + 1, wall_clock)}
+
+    def _solution_score(self, solution):
+        if not self._is_complete(solution):
+            return 1e9
+        travel = self.calc.compute_transportation_cost(solution)
+        total_pen = 0.0
+        for route in solution.values():
+            if not route:
+                continue
+            pen, hard = self._route_penalty(route)
+            if hard:
+                return 1e9
+            total_pen += pen
+        return travel + (self.lambda_W + self.lambda_S) * total_pen
+
+    def _ant_construct(self):
+        order = list(range(self.n_customers))
+        random.shuffle(order)
         solution = {}
-        
-        for customer in unassigned:
-            best_vid = None
-            best_pos = None
-            best_score = -float('inf')
-            
+        for c in order:
+            best = None
             for vid, route in solution.items():
                 for pos in range(len(route) + 1):
-                    test_route = route[:pos] + [customer] + route[pos:]
-                    if self._is_route_feasible(test_route):
-                        if pos == 0:
-                            prev = 0
-                            next_node = route[0] + 1 if route else 0
-                        elif pos == len(route):
-                            prev = route[-1] + 1
-                            next_node = 0
-                        else:
-                            prev = route[pos-1] + 1
-                            next_node = route[pos] + 1
-                        
-                        dist_prev = self.distance_matrix[prev][customer + 1] if prev != 0 else 0
-                        dist_next = self.distance_matrix[customer + 1][next_node] if next_node != 0 else 0
-                        heuristic = 1.0 / (dist_prev + dist_next + 1)
-                        
-                        pheromone = self.pheromone[prev][customer + 1] + self.pheromone[customer + 1][next_node]
-                        score = (pheromone ** self.params['alpha']) * (heuristic ** self.params['beta'])
-                        
-                        if score > best_score:
-                            best_score = score
-                            best_vid = vid
-                            best_pos = pos
-            
-            if best_vid is not None:
-                solution[best_vid].insert(best_pos, customer)
+                    test = route[:pos] + [c] + route[pos:]
+                    pen, hard = self._route_penalty(test)
+                    if hard:
+                        continue
+                    if pos == 0:
+                        prev = 0
+                        nxt = route[0] + 1 if route else 0
+                    elif pos == len(route):
+                        prev = route[-1] + 1
+                        nxt = 0
+                    else:
+                        prev = route[pos - 1] + 1
+                        nxt = route[pos] + 1
+                    h = 1.0 / (self.distance_matrix[prev][c + 1] +
+                               self.distance_matrix[c + 1][nxt] + 1e-6)
+                    pher = 0.5 * (self.pheromone[prev][c + 1] +
+                                  self.pheromone[c + 1][nxt])
+                    sc = (pher ** self.params["alpha"]) * (h ** self.params["beta"])
+                    if best is None or sc > best[0]:
+                        best = (sc, vid, pos)
+            if best is None:
+                solution[len(solution)] = [c]
             else:
-                solution[len(solution)] = [customer]
-        
+                _, vid, pos = best
+                solution[vid].insert(pos, c)
         return solution
-    
-    def _update_pheromone(self, solutions: List[Dict], costs: List[float]):
-        for solution, cost in zip(solutions, costs):
-            if cost <= 0:
+
+    def _update_pheromone(self, sols, costs):
+        for s, c in zip(sols, costs):
+            if c <= 0 or not np.isfinite(c):
                 continue
-            delta = 1.0 / cost
-            for route in solution.values():
+            d = 1.0 / c
+            for route in s.values():
                 if not route:
                     continue
-                nodes = [0] + [c + 1 for c in route] + [0]
+                nodes = [0] + [x + 1 for x in route] + [0]
                 for i in range(len(nodes) - 1):
-                    self.pheromone[nodes[i]][nodes[i+1]] += delta
-                    self.pheromone[nodes[i+1]][nodes[i]] += delta
+                    self.pheromone[nodes[i]][nodes[i + 1]] += d
+                    self.pheromone[nodes[i + 1]][nodes[i]] += d
 
 
 # ============================================================================
-# ALGORITHM 6: IALNS (Proposed - Full)
+# SA-ALNS and ablation variants
 # ============================================================================
 
-class IALNSAlgorithm(BaseAlgorithm):
-    def __init__(self, instance_data: Dict, vehicle: Vehicle, params: Dict = None):
-        super().__init__(instance_data, vehicle)
+class SAALNSAlgorithm(BaseAlgorithm):
+    def __init__(self, instance_data, vehicle, params=None, stability_weight=0.35):
+        super().__init__(instance_data, vehicle, stability_weight=stability_weight)
         self.params = params or {
-            'max_iterations': 150,
-            'initial_temperature': 100.0,
-            'cooling_rate': 0.99,
-            'destruction_rate': 0.3,
-            'learning_rate': 0.15,
-            'stability_weight': 0.35,
-            'distance_weight': 0.65,
-            'tabu_tenure': 10,
-            'adaptive_frequency': 10,
-            'max_no_improvement': 50,
-            'cg_weight': 0.2,
-            'handling_cost_weight': 0.10,
-            'overload_penalty_weight': 1.00,
+            "max_iterations": 150, "initial_temperature": 100.0,
+            "cooling_rate": 0.99, "destruction_rate": 0.3,
+            "learning_rate": 0.15, "stability_weight": stability_weight,
+            "tabu_tenure": 10, "adaptive_frequency": 10,
+            "max_no_improvement": 50,
         }
-        
-        self.destroy_weights = {
-            'random': 1.0,
-            'worst': 1.2,
-            'compatibility': 1.0,
-            'imbalance': 1.3,
-            'shaw': 1.1
-        }
-        self.repair_weights = {
-            'greedy': 1.0,
-            'regret': 1.3,
-            'stability_aware': 1.5,
-            'balance': 1.1
-        }
-        self.tabu_list = []
-        self.cg_history = []
-        
-    def solve(self) -> Tuple[Dict[int, List[int]], float, Dict]:
-        start_time = time.time()
-        
-        solution = self._generate_enhanced_initial_solution()
-        current_cost = self.calc.compute_transportation_cost(solution)
-        best_solution = solution.copy()
-        best_cost = current_cost
-        best_metrics = self.calc.compute_all_metrics(solution, iterations_to_convergence=0)
-        
-        temperature = self.params['initial_temperature']
-        iterations = 0
-        no_improvement = 0
-        
-        destroy_performance = defaultdict(list)
-        repair_performance = defaultdict(list)
-        
-        while iterations < self.params['max_iterations']:
-            iterations += 1
-            
-            destroy_op = self._select_adaptive_operator(self.destroy_weights)
-            repair_op = self._select_adaptive_operator(self.repair_weights)
-            
-            destroyed, removed = self._apply_enhanced_destroy(solution, destroy_op)
-            repaired = self._apply_enhanced_repair(destroyed, removed, repair_op)
-            
-            new_cost, stability_score, cg_score = self._evaluate_with_stability_and_cg(repaired)
-            
-            improvement = (current_cost - new_cost) / current_cost if current_cost > 0 else 0
-            destroy_performance[destroy_op].append(improvement)
-            repair_performance[repair_op].append(improvement)
-            
-            cg_metrics = self.calc.compute_cg_metrics(repaired)
-            self.cg_history.append({
-                'iteration': iterations,
-                'cg_mean': cg_metrics['cg_position_mean'],
-                'cg_compliance': cg_metrics['cg_compliance_rate']
-            })
-            
-            if self._accept_solution(new_cost, current_cost, temperature, stability_score, cg_score):
+        self.saca.stability_weight = self.params["stability_weight"]
+        self.calc.stability_weight = self.params["stability_weight"]
+        self.destroy_weights = {"random": 1.0, "worst": 1.2, "compatibility": 1.0,
+                                "imbalance": 1.3, "shaw": 1.1}
+        self.repair_weights = {"greedy": 1.0, "regret": 1.3,
+                               "stability_aware": 1.5, "balance": 1.1}
+
+    def solve(self):
+        t0 = time.time()
+        solution = self._enhanced_initial()
+        current = self._solution_score(solution)
+        best, best_cost = solution.copy(), current
+        T = self.params["initial_temperature"]
+        it, noimp = 0, 0
+        dperf, rperf = defaultdict(list), defaultdict(list)
+        while it < self.params["max_iterations"]:
+            it += 1
+            d_op = self._select(self.destroy_weights)
+            r_op = self._select(self.repair_weights)
+            destroyed, removed = self._destroy(solution, d_op)
+            repaired = self._repair(destroyed, removed, r_op)
+            new_cost = self._solution_score(repaired)
+            if current > 0 and np.isfinite(current) and np.isfinite(new_cost):
+                imp = (current - new_cost) / current
+                dperf[d_op].append(imp)
+                rperf[r_op].append(imp)
+            if (new_cost < current or
+                    random.random() < math.exp(-(new_cost - current) / max(T, 1e-10))):
                 solution = repaired
-                current_cost = new_cost
+                current = new_cost
                 if new_cost < best_cost:
-                    best_solution = solution.copy()
-                    best_cost = new_cost
-                    best_metrics = self.calc.compute_all_metrics(best_solution, iterations_to_convergence=iterations)
-                    no_improvement = 0
-                    self.tabu_list.append(best_solution)
-                    if len(self.tabu_list) > self.params['tabu_tenure']:
-                        self.tabu_list.pop(0)
+                    best, best_cost = solution.copy(), new_cost
+                    noimp = 0
                 else:
-                    no_improvement += 1
+                    noimp += 1
             else:
-                no_improvement += 1
-            
-            if iterations % self.params['adaptive_frequency'] == 0:
-                self._update_adaptive_weights(destroy_performance, repair_performance)
-                destroy_performance.clear()
-                repair_performance.clear()
-            
-            temperature *= self.params['cooling_rate']
-            
-            if no_improvement > 20:
-                self.params['stability_weight'] = min(0.6, self.params['stability_weight'] * 1.05)
-            
+                noimp += 1
+            if it % self.params["adaptive_frequency"] == 0:
+                self._update_weights(dperf, rperf)
+                dperf.clear()
+                rperf.clear()
+            T *= self.params["cooling_rate"]
             self.convergence_history.append(best_cost)
-            
-            if no_improvement > self.params['max_no_improvement']:
-                if self._verify_global_stability(best_solution):
-                    break
-        
-        best_metrics = self.calc.compute_all_metrics(best_solution, iterations_to_convergence=iterations)
-        best_metrics.cpu_time = time.time() - start_time
-        best_metrics.milp_calls = self.milp_calls
-        best_metrics.cache_hit_rate = (self.cache_hits / max(1, self.milp_calls + self.cache_hits)) * 100
-        best_metrics.iterations_to_convergence = iterations
-        
-        # Store parameter combination in metrics
-        best_metrics.parameter_combination = {
-            'handling_cost_weight': self.params.get('handling_cost_weight', 0.10),
-            'overload_penalty_weight': self.params.get('overload_penalty_weight', 1.00),
-            'stability_weight': self.params.get('stability_weight', 0.35),
-        }
-        
-        extra = {
-            'metrics': best_metrics,
-            'convergence': self.convergence_history,
-            'destroy_weights': self.destroy_weights,
-            'repair_weights': self.repair_weights,
-            'cg_history': self.cg_history
-        }
-        
-        return best_solution, best_cost, extra
-    
-    def _generate_enhanced_initial_solution(self) -> Dict[int, List[int]]:
-        n_customers = self.n_customers
-        unassigned = list(range(n_customers))
-        customer_demands = []
-        for c in unassigned:
-            total_demand = sum(self.instance_data['customers'][c]['demand'].values())
-            customer_demands.append((c, total_demand))
-        customer_demands.sort(key=lambda x: x[1], reverse=True)
-        
+            if noimp > self.params["max_no_improvement"]:
+                break
+        wall_clock = time.time() - t0
+        return best, best_cost, {"metrics": self._finalize(best, it, wall_clock),
+                                 "convergence": self.convergence_history}
+
+    def _solution_score(self, solution):
+        if not self._is_complete(solution):
+            return 1e9
+        travel = self.calc.compute_transportation_cost(solution)
+        total_pen = 0.0
+        for route in solution.values():
+            if not route:
+                continue
+            pen, hard = self._route_penalty(route)
+            if hard:
+                return 1e9
+            total_pen += pen
+        return travel + (self.lambda_W + self.lambda_S) * total_pen
+
+    def _enhanced_initial(self):
+        order = sorted(range(self.n_customers),
+                       key=lambda c: sum(self.instance_data["customers"][c]["demand"].values()),
+                       reverse=True)
         solution = {}
-        for customer, _ in customer_demands:
-            inserted = False
-            best_vid = None
-            best_pos = None
-            best_stability_score = float('inf')
-            
+        for c in order:
+            best_vid, best_pos, best_score = None, None, float("inf")
             for vid, route in solution.items():
                 for pos in range(len(route) + 1):
-                    new_route = route[:pos] + [customer] + route[pos:]
-                    if self._is_route_feasible_with_stability(new_route):
-                        stability_score = self._compute_route_stability(new_route)
-                        cg_score = self._compute_route_cg_score(new_route)
-                        combined_score = 0.7 * stability_score + 0.3 * cg_score
-                        if combined_score < best_stability_score:
-                            best_stability_score = combined_score
-                            best_vid = vid
-                            best_pos = pos
-                            inserted = True
-            
-            if inserted:
-                solution[best_vid].insert(best_pos, customer)
+                    test = route[:pos] + [c] + route[pos:]
+                    pen, hard = self._route_penalty(test)
+                    if hard:
+                        continue
+                    score = (self.calc.compute_transportation_cost({vid: test})
+                             + (self.lambda_W + self.lambda_S) * pen
+                             + 0.5 * self._slosh_component(test))
+                    if score < best_score:
+                        best_score, best_vid, best_pos = score, vid, pos
+            if best_vid is not None:
+                solution[best_vid].insert(best_pos, c)
             else:
-                solution[len(solution)] = [customer]
-        
+                solution[len(solution)] = [c]
+        if self._is_trivial(solution):
+            return self._generate_initial_solution()
         return solution
-    
-    def _compute_route_cg_score(self, route: List[int]) -> float:
-        demands = self._extract_demands(route)
-        feasible, allocation = self.saca.solve_heuristic(demands, self.vehicle.product_densities)
-        if feasible and allocation:
-            load = {c_id: allocation[c_id] * self.vehicle.product_densities.get(1, 0.8)
-                   for c_id in allocation if allocation[c_id] > 0}
-            ldd_result = LDDVerifier(self.vehicle).verify_load(load)
-            if ldd_result.feasible:
-                optimum_cg = 0.45 * self.vehicle.wheelbase
-                deviation = abs(ldd_result.cg_position - optimum_cg) / (0.2 * self.vehicle.wheelbase)
-                return min(deviation, 1.0)
-        return 1.0
-    
-    def _is_route_feasible_with_stability(self, route: List[int]) -> bool:
-        if not route:
-            return True
-        route_key = tuple(sorted(route))
-        if route_key in self.feasibility_cache:
-            self.cache_hits += 1
-            return self.feasibility_cache[route_key]
-        
-        demands = self._extract_demands(route)
-        total_volume = sum(demands.values())
-        if total_volume > self.vehicle.max_volume:
-            self.feasibility_cache[route_key] = False
-            return False
-        
-        self.milp_calls += 1
-        feasible, allocation = self.saca.solve_heuristic(demands, self.vehicle.product_densities)
-        
-        if feasible and allocation:
-            load = {c_id: allocation[c_id] * self.vehicle.product_densities.get(1, 0.8)
-                   for c_id in allocation if allocation[c_id] > 0}
-            ldd_result = LDDVerifier(self.vehicle).verify_load(load)
-            feasible = ldd_result.feasible and ldd_result.stability_margin > 5.0
-        
-        self.feasibility_cache[route_key] = feasible
-        return feasible
-    
-    def _compute_route_stability(self, route: List[int]) -> float:
-        demands = self._extract_demands(route)
-        feasible, allocation = self.saca.solve_heuristic(demands, self.vehicle.product_densities)
-        if feasible and allocation:
-            load = {c_id: allocation[c_id] * self.vehicle.product_densities.get(1, 0.8)
-                   for c_id in allocation if allocation[c_id] > 0}
-            ldd_result = LDDVerifier(self.vehicle).verify_load(load)
-            return 100.0 - ldd_result.stability_margin
-        return 100.0
-    
-    def _select_adaptive_operator(self, weights: Dict[str, float]) -> str:
-        total = sum(weights.values())
-        if total == 0:
-            return random.choice(list(weights.keys()))
-        
+
+    def _slosh_component(self, route):
+        demands = {c: self.instance_data["customers"][c]["demand"] for c in route}
+        travel = self.calc.compute_transportation_cost({0: route})
+        pen, _, _, hard = self.saca.verify_route(
+            route, demands, transport_cost=travel, skip_sequence_check=True)
+        return 0.0 if hard else pen
+
+    @property
+    def ldd_verifier(self):
+        return self.saca.ldd_verifier
+
+    def _select(self, weights):
         if random.random() < 0.15:
             return random.choice(list(weights.keys()))
-        
+        total = sum(weights.values()) or 1.0
         r = random.random() * total
-        cumsum = 0
+        acc = 0
         for op, w in weights.items():
-            cumsum += w
-            if r <= cumsum:
+            acc += w
+            if r <= acc:
                 return op
         return list(weights.keys())[-1]
-    
-    def _apply_enhanced_destroy(self, solution: Dict[int, List[int]], operator: str) -> Tuple[Dict[int, List[int]], List[int]]:
-        if operator == 'random':
+
+    def _destroy(self, solution, op):
+        if op == "random":
             return self._destroy_random(solution)
-        elif operator == 'worst':
-            return self._destroy_worst_enhanced(solution)
-        elif operator == 'compatibility':
-            return self._destroy_compatibility(solution)
-        elif operator == 'imbalance':
-            return self._destroy_imbalance_enhanced(solution)
-        elif operator == 'shaw':
-            return self._destroy_shaw(solution)
-        return solution, []
-    
-    def _destroy_random(self, solution: Dict[int, List[int]]) -> Tuple[Dict[int, List[int]], List[int]]:
-        new_solution = {k: v.copy() for k, v in solution.items()}
-        all_customers = [c for route in new_solution.values() for c in route]
-        n_remove = max(2, int(len(all_customers) * self.params['destruction_rate']))
-        
-        if len(all_customers) > n_remove:
-            to_remove = set(random.sample(all_customers, n_remove))
-            removed = list(to_remove)
-            for vid in list(new_solution.keys()):
-                new_solution[vid] = [c for c in new_solution[vid] if c not in to_remove]
-                if not new_solution[vid]:
-                    del new_solution[vid]
-            return new_solution, removed
-        return new_solution, []
-    
-    def _destroy_worst_enhanced(self, solution: Dict[int, List[int]]) -> Tuple[Dict[int, List[int]], List[int]]:
-        new_solution = {k: v.copy() for k, v in solution.items()}
-        marginal_costs = {}
-        for vid, route in new_solution.items():
+        if op == "worst":
+            return self._destroy_worst(solution)
+        if op == "compatibility":
+            return self._destroy_compat(solution)
+        if op == "imbalance":
+            return self._destroy_imbalance(solution)
+        return self._destroy_shaw(solution)
+
+    def _destroy_random(self, solution):
+        new = {k: v.copy() for k, v in solution.items()}
+        all_c = [c for r in new.values() for c in r]
+        n_remove = max(2, int(len(all_c) * self.params["destruction_rate"]))
+        if len(all_c) <= n_remove:
+            return new, []
+        to_remove = set(random.sample(all_c, n_remove))
+        for vid in list(new.keys()):
+            new[vid] = [c for c in new[vid] if c not in to_remove]
+            if not new[vid]:
+                del new[vid]
+        return new, list(to_remove)
+
+    def _destroy_worst(self, solution):
+        new = {k: v.copy() for k, v in solution.items()}
+        marginal = {}
+        for vid, route in new.items():
             if len(route) <= 1:
                 continue
-            for idx, customer in enumerate(route):
-                route_without = route[:idx] + route[idx+1:]
-                if route_without:
-                    cost_with = self.calc.compute_transportation_cost({vid: route})
-                    cost_without = self.calc.compute_transportation_cost({vid: route_without})
-                    marginal_costs[(vid, customer)] = cost_with - cost_without
-        
-        if marginal_costs:
-            n_remove = max(2, int(len(marginal_costs) * self.params['destruction_rate'] * 0.8))
-            sorted_customers = sorted(marginal_costs.items(), key=lambda x: x[1], reverse=True)
-            to_remove = {item[0] for item in sorted_customers[:n_remove]}
-            removed = [c for _, c in to_remove]
-            for vid in list(new_solution.keys()):
-                new_solution[vid] = [c for c in new_solution[vid] if (vid, c) not in to_remove]
-                if not new_solution[vid]:
-                    del new_solution[vid]
-            return new_solution, removed
-        return new_solution, []
-    
-    def _destroy_shaw(self, solution: Dict[int, List[int]]) -> Tuple[Dict[int, List[int]], List[int]]:
-        new_solution = {k: v.copy() for k, v in solution.items()}
-        all_customers = [c for route in new_solution.values() for c in route]
-        
-        if len(all_customers) < 3:
+            for i, c in enumerate(route):
+                rw = route[:i] + route[i + 1:]
+                if rw:
+                    marginal[(vid, c)] = (self.calc.compute_transportation_cost({vid: route}) -
+                                          self.calc.compute_transportation_cost({vid: rw}))
+        if not marginal:
+            return new, []
+        k = max(2, int(len(marginal) * self.params["destruction_rate"] * 0.8))
+        to_remove = {x[0] for x in sorted(marginal.items(), key=lambda x: x[1], reverse=True)[:k]}
+        removed = [c for _, c in to_remove]
+        for vid in list(new.keys()):
+            new[vid] = [c for c in new[vid] if (vid, c) not in to_remove]
+            if not new[vid]:
+                del new[vid]
+        return new, removed
+
+    def _destroy_shaw(self, solution):
+        new = {k: v.copy() for k, v in solution.items()}
+        all_c = [c for r in new.values() for c in r]
+        if len(all_c) < 3:
             return self._destroy_random(solution)
-        
-        seed = random.choice(all_customers)
-        seed_demand = set(self.instance_data['customers'][seed]['demand'].keys())
-        
+        seed = random.choice(all_c)
+        sp = set(self.instance_data["customers"][seed]["demand"].keys())
         similar = []
-        for customer in all_customers:
-            if customer == seed:
+        for c in all_c:
+            if c == seed:
                 continue
-            customer_demand = set(self.instance_data['customers'][customer]['demand'].keys())
-            overlap = len(seed_demand.intersection(customer_demand))
-            if overlap > 0:
-                similar.append((customer, overlap))
-        
+            ov = len(sp.intersection(set(self.instance_data["customers"][c]["demand"].keys())))
+            if ov > 0:
+                similar.append((c, ov))
         similar.sort(key=lambda x: x[1], reverse=True)
-        n_remove = max(2, min(len(similar), int(len(all_customers) * self.params['destruction_rate'] * 0.7)))
-        
-        if similar:
-            to_remove = {seed} | {c for c, _ in similar[:n_remove]}
-            removed = list(to_remove)
-            for vid in list(new_solution.keys()):
-                new_solution[vid] = [c for c in new_solution[vid] if c not in to_remove]
-                if not new_solution[vid]:
-                    del new_solution[vid]
-            return new_solution, removed
-        return new_solution, []
-    
-    def _destroy_compatibility(self, solution: Dict[int, List[int]]) -> Tuple[Dict[int, List[int]], List[int]]:
-        new_solution = {k: v.copy() for k, v in solution.items()}
-        incompatibilities = defaultdict(list)
-        
-        for vid, route in new_solution.items():
+        k = max(2, min(len(similar), int(len(all_c) * self.params["destruction_rate"] * 0.7)))
+        if not similar:
+            return new, []
+        to_remove = {seed} | {c for c, _ in similar[:k]}
+        for vid in list(new.keys()):
+            new[vid] = [c for c in new[vid] if c not in to_remove]
+            if not new[vid]:
+                del new[vid]
+        return new, list(to_remove)
+
+    def _destroy_compat(self, solution):
+        new = {k: v.copy() for k, v in solution.items()}
+        inc = defaultdict(list)
+        for vid, route in new.items():
             if len(route) <= 1:
                 continue
             for i, c1 in enumerate(route):
-                for c2 in route[i+1:]:
-                    p1 = set(self.instance_data['customers'][c1]['demand'].keys())
-                    p2 = set(self.instance_data['customers'][c2]['demand'].keys())
+                for c2 in route[i + 1:]:
+                    p1 = set(self.instance_data["customers"][c1]["demand"].keys())
+                    p2 = set(self.instance_data["customers"][c2]["demand"].keys())
                     if p1 != p2:
-                        incompatibilities[vid].append(c1)
-                        incompatibilities[vid].append(c2)
-        
-        if incompatibilities:
-            target_vid = random.choice(list(incompatibilities.keys()))
-            incompatible_customers = list(set(incompatibilities[target_vid]))
-            n_remove = max(2, min(len(incompatible_customers), int(len(incompatible_customers) * 0.5)))
-            to_remove = set(random.sample(incompatible_customers, n_remove))
-            removed = list(to_remove)
-            new_solution[target_vid] = [c for c in new_solution[target_vid] if c not in to_remove]
-            if not new_solution[target_vid]:
-                del new_solution[target_vid]
-            return new_solution, removed
-        return new_solution, []
-    
-    def _destroy_imbalance_enhanced(self, solution: Dict[int, List[int]]) -> Tuple[Dict[int, List[int]], List[int]]:
-        new_solution = {k: v.copy() for k, v in solution.items()}
-        unstable_routes = []
-        
-        for vid, route in new_solution.items():
+                        inc[vid].extend([c1, c2])
+        if not inc:
+            return new, []
+        target = random.choice(list(inc.keys()))
+        unique = list(set(inc[target]))
+        k = max(2, min(len(unique), int(len(unique) * 0.5)))
+        to_remove = set(random.sample(unique, k))
+        new[target] = [c for c in new[target] if c not in to_remove]
+        if not new[target]:
+            del new[target]
+        return new, list(to_remove)
+
+    def _destroy_imbalance(self, solution):
+        new = {k: v.copy() for k, v in solution.items()}
+        unstable = []
+        for vid, route in new.items():
             if len(route) <= 1:
                 continue
-            if not self._is_route_feasible_with_stability(route):
-                unstable_routes.append(vid)
-        
-        if unstable_routes:
-            target_vid = random.choice(unstable_routes)
-            route = new_solution[target_vid]
-            for idx, customer in enumerate(route):
-                test_route = route[:idx] + route[idx+1:]
-                if self._is_route_feasible_with_stability(test_route):
-                    to_remove = {customer}
-                    removed = [customer]
-                    new_solution[target_vid] = [c for c in route if c not in to_remove]
-                    if not new_solution[target_vid]:
-                        del new_solution[target_vid]
-                    return new_solution, removed
+            pen, hard = self._route_penalty(route)
+            if hard or pen > 1e-6:
+                unstable.append(vid)
+        if not unstable:
+            return self._destroy_random(solution)
+        target = random.choice(unstable)
+        route = new[target]
+        for i, c in enumerate(route):
+            test = route[:i] + route[i + 1:]
+            pen, hard = self._route_penalty(test)
+            if not hard:
+                new[target] = [x for x in route if x != c]
+                if not new[target]:
+                    del new[target]
+                return new, [c]
         return self._destroy_random(solution)
-    
-    def _apply_enhanced_repair(self, solution: Dict[int, List[int]], unassigned: List[int], operator: str) -> Dict[int, List[int]]:
-        if operator == 'greedy':
+
+    def _repair(self, solution, unassigned, op):
+        if op == "greedy":
             return self._repair_greedy(solution, unassigned)
-        elif operator == 'regret':
-            return self._repair_regret_enhanced(solution, unassigned)
-        elif operator == 'stability_aware':
-            return self._repair_stability_aware(solution, unassigned)
-        elif operator == 'balance':
-            return self._repair_balance(solution, unassigned)
-        return solution
-    
-    def _repair_greedy(self, solution: Dict[int, List[int]], unassigned: List[int]) -> Dict[int, List[int]]:
-        new_solution = {k: v.copy() for k, v in solution.items()}
-        remaining = unassigned[:]
-        random.shuffle(remaining)
-        
-        for customer in remaining[:]:
-            best_vid = None
-            best_pos = None
-            best_cost = float('inf')
-            
-            for vid, route in new_solution.items():
+        if op == "regret":
+            return self._repair_regret(solution, unassigned)
+        if op == "stability_aware":
+            return self._repair_stab(solution, unassigned)
+        return self._repair_balance(solution, unassigned)
+
+    def _repair_greedy(self, solution, unassigned):
+        new = {k: v.copy() for k, v in solution.items()}
+        rem = unassigned[:]
+        random.shuffle(rem)
+        for c in rem[:]:
+            best_vid, best_pos, best_score = None, None, float("inf")
+            for vid, route in new.items():
                 for pos in range(len(route) + 1):
-                    new_route = route[:pos] + [customer] + route[pos:]
-                    if self._is_route_feasible_with_stability(new_route):
-                        cost = self.calc.compute_transportation_cost({vid: new_route})
-                        if cost < best_cost:
-                            best_cost = cost
-                            best_vid = vid
-                            best_pos = pos
-            
+                    test = route[:pos] + [c] + route[pos:]
+                    pen, hard = self._route_penalty(test)
+                    if hard:
+                        continue
+                    score = (self.calc.compute_transportation_cost({vid: test})
+                             + (self.lambda_W + self.lambda_S) * pen)
+                    if score < best_score:
+                        best_score, best_vid, best_pos = score, vid, pos
             if best_vid is not None:
-                new_solution[best_vid].insert(best_pos, customer)
-                remaining.remove(customer)
-        
-        for customer in remaining:
-            if self._is_route_feasible_with_stability([customer]):
-                new_solution[len(new_solution)] = [customer]
-            else:
-                new_solution[len(new_solution)] = [customer]
-        
-        return new_solution
-    
-    def _repair_regret_enhanced(self, solution: Dict[int, List[int]], unassigned: List[int]) -> Dict[int, List[int]]:
-        new_solution = {k: v.copy() for k, v in solution.items()}
-        remaining = unassigned[:]
-        
-        while remaining:
+                new[best_vid].insert(best_pos, c)
+                rem.remove(c)
+        for c in rem:
+            new[len(new)] = [c]
+        return new
+
+    def _repair_regret(self, solution, unassigned):
+        new = {k: v.copy() for k, v in solution.items()}
+        rem = unassigned[:]
+        while rem:
             regrets = []
-            for customer in remaining:
+            for c in rem:
                 costs = []
-                for vid, route in new_solution.items():
+                for vid, route in new.items():
                     for pos in range(len(route) + 1):
-                        new_route = route[:pos] + [customer] + route[pos:]
-                        if self._is_route_feasible_with_stability(new_route):
-                            costs.append(self.calc.compute_transportation_cost({vid: new_route}))
-                
+                        test = route[:pos] + [c] + route[pos:]
+                        pen, hard = self._route_penalty(test)
+                        if not hard:
+                            costs.append(self.calc.compute_transportation_cost({vid: test})
+                                         + (self.lambda_W + self.lambda_S) * pen)
                 if len(costs) >= 2:
                     costs.sort()
-                    regret = costs[1] - costs[0]
+                    regrets.append((costs[1] - costs[0], c))
                 elif costs:
-                    regret = costs[0]
+                    regrets.append((costs[0], c))
                 else:
-                    regret = float('inf')
-                regrets.append((regret, customer))
-            
+                    regrets.append((float("inf"), c))
             if not regrets:
                 break
-            
             regrets.sort(key=lambda x: x[0], reverse=True)
-            if regrets[0][0] == float('inf'):
-                customer = remaining.pop(0)
-                new_solution[len(new_solution)] = [customer]
+            if regrets[0][0] == float("inf"):
+                c = rem.pop(0)
+                new[len(new)] = [c]
                 continue
-            
-            customer = regrets[0][1]
-            best_vid = None
-            best_pos = None
-            best_cost = float('inf')
-            
-            for vid, route in new_solution.items():
+            c = regrets[0][1]
+            best_vid, best_pos, best_score = None, None, float("inf")
+            for vid, route in new.items():
                 for pos in range(len(route) + 1):
-                    new_route = route[:pos] + [customer] + route[pos:]
-                    if self._is_route_feasible_with_stability(new_route):
-                        cost = self.calc.compute_transportation_cost({vid: new_route})
-                        if cost < best_cost:
-                            best_cost = cost
-                            best_vid = vid
-                            best_pos = pos
-            
-            if best_vid is not None:
-                new_solution[best_vid].insert(best_pos, customer)
-                remaining.remove(customer)
-            else:
-                new_solution[len(new_solution)] = [customer]
-                remaining.remove(customer)
-        
-        return new_solution
-    
-    def _repair_stability_aware(self, solution: Dict[int, List[int]], unassigned: List[int]) -> Dict[int, List[int]]:
-        new_solution = {k: v.copy() for k, v in solution.items()}
-        remaining = unassigned[:]
-        
-        for customer in remaining[:]:
-            best_vid = None
-            best_pos = None
-            best_score = float('inf')
-            
-            for vid, route in new_solution.items():
-                for pos in range(len(route) + 1):
-                    new_route = route[:pos] + [customer] + route[pos:]
-                    if not self._is_route_feasible_with_stability(new_route):
+                    test = route[:pos] + [c] + route[pos:]
+                    pen, hard = self._route_penalty(test)
+                    if hard:
                         continue
-                    
-                    demands = self._extract_demands(new_route)
-                    feasible, allocation = self.saca.solve_heuristic(demands, self.vehicle.product_densities)
-                    
-                    stability_penalty = 0.0
-                    cg_penalty = 0.0
-                    if feasible and allocation:
-                        load = {c_id: allocation[c_id] * self.vehicle.product_densities.get(1, 0.8)
-                               for c_id in allocation if allocation[c_id] > 0}
-                        ldd_result = LDDVerifier(self.vehicle).verify_load(load)
-                        stability_penalty = 100.0 - ldd_result.stability_margin
-                        optimum_cg = 0.45 * self.vehicle.wheelbase
-                        cg_penalty = abs(ldd_result.cg_position - optimum_cg) / (0.2 * self.vehicle.wheelbase)
-                    else:
-                        stability_penalty = 100.0
-                        cg_penalty = 1.0
-                    
-                    dist_cost = self.calc.compute_transportation_cost({vid: new_route})
-                    score = (1 - self.params['stability_weight']) * dist_cost + \
-                            self.params['stability_weight'] * stability_penalty + \
-                            0.1 * self.params['cg_weight'] * cg_penalty * dist_cost
-                    
+                    score = (self.calc.compute_transportation_cost({vid: test})
+                             + (self.lambda_W + self.lambda_S) * pen)
                     if score < best_score:
-                        best_score = score
-                        best_vid = vid
-                        best_pos = pos
-            
+                        best_score, best_vid, best_pos = score, vid, pos
             if best_vid is not None:
-                new_solution[best_vid].insert(best_pos, customer)
-                remaining.remove(customer)
-        
-        for customer in remaining:
-            if self._is_route_feasible_with_stability([customer]):
-                new_solution[len(new_solution)] = [customer]
-        
-        return new_solution
-    
-    def _repair_balance(self, solution: Dict[int, List[int]], unassigned: List[int]) -> Dict[int, List[int]]:
-        new_solution = {k: v.copy() for k, v in solution.items()}
-        remaining = unassigned[:]
-        random.shuffle(remaining)
-        
-        for customer in remaining[:]:
-            best_vid = None
-            best_pos = None
-            min_load = float('inf')
-            
-            for vid, route in new_solution.items():
-                current_demand = sum(self._extract_demands(route).values())
-                if current_demand < min_load:
+                new[best_vid].insert(best_pos, c)
+            else:
+                new[len(new)] = [c]
+            rem.remove(c)
+        return new
+
+    def _repair_stab(self, solution, unassigned):
+        new = {k: v.copy() for k, v in solution.items()}
+        rem = unassigned[:]
+        for c in rem[:]:
+            best_vid, best_pos, best_score = None, None, float("inf")
+            for vid, route in new.items():
+                for pos in range(len(route) + 1):
+                    test = route[:pos] + [c] + route[pos:]
+                    pen, hard = self._route_penalty(test)
+                    if hard:
+                        continue
+                    score = (self.calc.compute_transportation_cost({vid: test})
+                             + (self.lambda_W + self.lambda_S) * pen
+                             + self.params["stability_weight"] * self._slosh_component(test))
+                    if score < best_score:
+                        best_score, best_vid, best_pos = score, vid, pos
+            if best_vid is not None:
+                new[best_vid].insert(best_pos, c)
+                rem.remove(c)
+        for c in rem:
+            new[len(new)] = [c]
+        return new
+
+    def _repair_balance(self, solution, unassigned):
+        new = {k: v.copy() for k, v in solution.items()}
+        rem = unassigned[:]
+        random.shuffle(rem)
+        for c in rem[:]:
+            min_load = float("inf")
+            best_vid, best_pos = None, None
+            for vid, route in new.items():
+                load = sum(self._extract_demands(route).values())
+                if load < min_load:
                     for pos in range(len(route) + 1):
-                        new_route = route[:pos] + [customer] + route[pos:]
-                        if self._is_route_feasible_with_stability(new_route):
-                            min_load = current_demand
-                            best_vid = vid
-                            best_pos = pos
+                        test = route[:pos] + [c] + route[pos:]
+                        pen, hard = self._route_penalty(test)
+                        if not hard:
+                            min_load, best_vid, best_pos = load, vid, pos
                             break
-            
             if best_vid is not None:
-                new_solution[best_vid].insert(best_pos, customer)
-                remaining.remove(customer)
-        
-        for customer in remaining:
-            new_solution[len(new_solution)] = [customer]
-        
-        return new_solution
-    
-    def _evaluate_with_stability_and_cg(self, solution: Dict[int, List[int]]) -> Tuple[float, float, float]:
-        total_cost = self.calc.compute_transportation_cost(solution)
-        stability_scores = []
-        cg_scores = []
-        
-        for route in solution.values():
-            if not route:
-                continue
-            stability_score = self._compute_route_stability(route)
-            stability_scores.append(stability_score)
-            cg_score = self._compute_route_cg_score(route)
-            cg_scores.append(cg_score)
-        
-        avg_stability = np.mean(stability_scores) if stability_scores else 0
-        avg_cg = np.mean(cg_scores) if cg_scores else 0
-        return total_cost, avg_stability, avg_cg
-    
-    def _accept_solution(self, new_cost: float, current_cost: float, temperature: float, 
-                         stability_score: float, cg_score: float) -> bool:
-        if new_cost < current_cost:
-            return True
-        
-        if stability_score < 20:
-            if new_cost < current_cost * 1.1:
-                return True
-        
-        if cg_score < 0.3:
-            if new_cost < current_cost * 1.05:
-                return True
-        
-        if temperature > 1e-10:
-            prob = math.exp(-(new_cost - current_cost) / temperature)
-            return random.random() < prob
-        
-        return False
-    
-    def _update_adaptive_weights(self, destroy_perf: Dict, repair_perf: Dict):
-        lr = self.params['learning_rate']
-        
-        for op, scores in destroy_perf.items():
-            if scores:
-                avg_score = np.mean(scores)
-                self.destroy_weights[op] = (1 - lr) * self.destroy_weights[op] + lr * max(0.1, avg_score * 2)
-        
-        for op, scores in repair_perf.items():
-            if scores:
-                avg_score = np.mean(scores)
-                self.repair_weights[op] = (1 - lr) * self.repair_weights[op] + lr * max(0.1, avg_score * 2)
-        
-        total_destroy = sum(self.destroy_weights.values())
-        if total_destroy > 0:
-            for op in self.destroy_weights:
-                self.destroy_weights[op] /= total_destroy
-        
-        total_repair = sum(self.repair_weights.values())
-        if total_repair > 0:
-            for op in self.repair_weights:
-                self.repair_weights[op] /= total_repair
-    
-    def _verify_global_stability(self, solution: Dict[int, List[int]]) -> bool:
-        violation_count = 0
-        total_routes = 0
-        
-        for route in solution.values():
-            if not route:
-                continue
-            total_routes += 1
-            if not self._is_route_feasible_with_stability(route):
-                violation_count += 1
-        
-        violation_rate = violation_count / max(1, total_routes) * 100
-        return violation_rate < 5.0
+                new[best_vid].insert(best_pos, c)
+                rem.remove(c)
+        for c in rem:
+            new[len(new)] = [c]
+        return new
+
+    def _update_weights(self, dperf, rperf):
+        lr = self.params["learning_rate"]
+        for op, s in dperf.items():
+            if s:
+                avg = float(np.mean(s))
+                self.destroy_weights[op] = ((1 - lr) * self.destroy_weights[op] +
+                                            lr * max(0.1, avg * 2))
+        for op, s in rperf.items():
+            if s:
+                avg = float(np.mean(s))
+                self.repair_weights[op] = ((1 - lr) * self.repair_weights[op] +
+                                           lr * max(0.1, avg * 2))
+        td = sum(self.destroy_weights.values()) or 1.0
+        tr = sum(self.repair_weights.values()) or 1.0
+        for op in self.destroy_weights:
+            self.destroy_weights[op] /= td
+        for op in self.repair_weights:
+            self.repair_weights[op] /= tr
 
 
-# ============================================================================
-# ABLATION VARIANTS
-# ============================================================================
+class SAALNS_NoStability(SAALNSAlgorithm):
+    def __init__(self, instance_data, vehicle, params=None, stability_weight=0.35):
+        super().__init__(instance_data, vehicle, params, stability_weight=0.0)
+        self.stability_weight = 0.0
+        self.saca.stability_weight = 0.0
+        self.params["stability_weight"] = 0.0
 
-class IALNS_NoStability(IALNSAlgorithm):
-    def __init__(self, instance_data: Dict, vehicle: Vehicle, params: Dict = None):
-        super().__init__(instance_data, vehicle, params)
-        self.params['stability_weight'] = 0.0
-        
-    def _is_route_feasible_with_stability(self, route: List[int]) -> bool:
-        if not route:
-            return True
-        route_key = tuple(sorted(route))
-        if route_key in self.feasibility_cache:
-            self.cache_hits += 1
-            return self.feasibility_cache[route_key]
-        
-        demands = self._extract_demands(route)
-        total_volume = sum(demands.values())
-        if total_volume > self.vehicle.max_volume:
-            self.feasibility_cache[route_key] = False
-            return False
-        self.feasibility_cache[route_key] = True
-        return True
-    
-    def _compute_route_stability(self, route: List[int]) -> float:
-        return 0.0
-    
-    def _compute_route_cg_score(self, route: List[int]) -> float:
+    def _slosh_component(self, route):
         return 0.0
 
-class IALNS_NoAdaptive(IALNSAlgorithm):
-    def __init__(self, instance_data: Dict, vehicle: Vehicle, params: Dict = None):
-        super().__init__(instance_data, vehicle, params)
-        
-    def _select_adaptive_operator(self, weights: Dict[str, float]) -> str:
+
+class SAALNS_NoAdaptive(SAALNSAlgorithm):
+    def _select(self, weights):
         return random.choice(list(weights.keys()))
-    
-    def _update_adaptive_weights(self, destroy_perf: Dict, repair_perf: Dict):
+
+    def _update_weights(self, dperf, rperf):
         pass
 
-class IALNS_Sequential(IALNSAlgorithm):
-    def __init__(self, instance_data: Dict, vehicle: Vehicle, params: Dict = None):
-        super().__init__(instance_data, vehicle, params)
-        
-    def _is_route_feasible_with_stability(self, route: List[int]) -> bool:
-        if not route:
-            return True
-        demands = self._extract_demands(route)
-        total_volume = sum(demands.values())
-        if total_volume > self.vehicle.max_volume:
-            return False
-        return True
-    
-    def solve(self) -> Tuple[Dict[int, List[int]], float, Dict]:
-        start_time = time.time()
-        
-        solution = self._generate_enhanced_initial_solution()
-        current_cost = self.calc.compute_transportation_cost(solution)
-        best_solution = solution.copy()
-        best_cost = current_cost
-        
-        temperature = self.params['initial_temperature']
-        iterations = 0
-        no_improvement = 0
-        
-        while iterations < self.params['max_iterations']:
-            iterations += 1
-            
-            destroy_op = self._select_adaptive_operator(self.destroy_weights)
-            repair_op = self._select_adaptive_operator(self.repair_weights)
-            
-            destroyed, removed = self._apply_enhanced_destroy(solution, destroy_op)
-            repaired = self._apply_enhanced_repair(destroyed, removed, repair_op)
-            
-            new_cost = self.calc.compute_transportation_cost(repaired)
-            
-            if new_cost < current_cost or random.random() < math.exp(-(new_cost - current_cost) / temperature):
-                solution = repaired
-                current_cost = new_cost
-                if new_cost < best_cost:
-                    best_solution = solution.copy()
-                    best_cost = new_cost
-                    no_improvement = 0
-                else:
-                    no_improvement += 1
+
+class SAALNS_Sequential(SAALNSAlgorithm):
+    def solve(self):
+        t0 = time.time()
+        routing_solution = self._solve_routing_only()
+        final = self._solve_loading_for_routes(routing_solution)
+        wall_clock = time.time() - t0
+        m = self._finalize(final, len(self.convergence_history), wall_clock)
+        return final, m.penalised_cost, {"metrics": m,
+                                         "convergence": self.convergence_history}
+
+    def _total_demand(self, customer):
+        return sum(self.instance_data["customers"][customer]["demand"].values())
+
+    def _routing_only_cost(self, solution):
+        return self.calc.compute_transportation_cost(solution)
+
+    def _route_total(self, route):
+        return sum(self._total_demand(c) for c in route)
+
+    def _fits_capacity(self, route):
+        return self._route_total(route) <= self.vehicle.max_volume + 1e-6
+
+    def _routing_only_insert(self, order):
+        solution = {}
+        for c in order:
+            best_vid, best_pos, best_score = None, None, float("inf")
+            for vid, route in solution.items():
+                for pos in range(len(route) + 1):
+                    test = route[:pos] + [c] + route[pos:]
+                    if not self._fits_capacity(test):
+                        continue
+                    score = self._routing_only_cost({vid: test})
+                    if score < best_score:
+                        best_score, best_vid, best_pos = score, vid, pos
+            if best_vid is not None:
+                solution[best_vid].insert(best_pos, c)
             else:
-                no_improvement += 1
-            
-            temperature *= self.params['cooling_rate']
-            
-            if no_improvement > self.params['max_no_improvement']:
-                break
-        
-        final_solution = {}
-        for vid, route in best_solution.items():
+                solution[len(solution)] = [c]
+        return solution
+
+    def _solve_routing_only(self):
+        order = sorted(range(self.n_customers),
+                       key=lambda c: -self._total_demand(c))
+        solution = self._routing_only_insert(order)
+        if self._is_trivial(solution):
+            ordered = list(range(self.n_customers))
+            random.shuffle(ordered)
+            solution = self._routing_only_insert(ordered)
+        for vid in list(solution.keys()):
+            route = solution[vid]
+            if len(route) < 3:
+                continue
+            improved = True
+            while improved:
+                improved = False
+                for i in range(len(route) - 2):
+                    for j in range(i + 2, len(route)):
+                        nr = route[:i] + route[i:j + 1][::-1] + route[j + 1:]
+                        if not self._fits_capacity(nr):
+                            continue
+                        if (self._routing_only_cost({vid: nr}) <
+                                self._routing_only_cost({vid: route})):
+                            solution[vid] = nr
+                            route = nr
+                            improved = True
+                            break
+                    if improved:
+                        break
+        self.convergence_history.append(self._routing_only_cost(solution))
+        return solution
+
+    def _solve_loading_for_routes(self, routing_solution):
+        final = {}
+        for _, route in routing_solution.items():
             if not route:
                 continue
-            
-            demands = self._extract_demands(route)
-            feasible, allocation = self.saca.solve_heuristic(demands, self.vehicle.product_densities)
-            
-            if feasible:
-                final_solution[vid] = route
+            demands = {c: self.instance_data["customers"][c]["demand"]
+                       for c in route}
+            travel = self.calc.compute_transportation_cost({0: route})
+            pen, _, _, hard = self.saca.verify_route(route, demands,
+                                                     transport_cost=travel,
+                                                     skip_sequence_check=True)
+            if not hard and pen < 1e-6:
+                final[len(final)] = route
+                continue
+            split = self._best_feasible_split(route)
+            if split is not None:
+                final[len(final)] = split[0]
+                final[len(final)] = split[1]
             else:
-                if len(route) > 1:
-                    best_split = None
-                    best_split_cost = float('inf')
-                    for i in range(1, len(route)):
-                        route1 = route[:i]
-                        route2 = route[i:]
-                        demands1 = self._extract_demands(route1)
-                        demands2 = self._extract_demands(route2)
-                        feasible1, _ = self.saca.solve_heuristic(demands1, self.vehicle.product_densities)
-                        feasible2, _ = self.saca.solve_heuristic(demands2, self.vehicle.product_densities)
-                        if feasible1 and feasible2:
-                            cost = self.calc.compute_transportation_cost({0: route1, 1: route2})
-                            if cost < best_split_cost:
-                                best_split_cost = cost
-                                best_split = [route1, route2]
-                    
-                    if best_split:
-                        final_solution[len(final_solution)] = best_split[0]
-                        final_solution[len(final_solution)] = best_split[1]
-                    else:
-                        for c in route:
-                            final_solution[len(final_solution)] = [c]
-                else:
-                    final_solution[vid] = route
-        
-        metrics = self.calc.compute_all_metrics(final_solution, iterations_to_convergence=iterations)
-        metrics.cpu_time = time.time() - start_time
-        metrics.milp_calls = self.milp_calls
-        metrics.cache_hit_rate = (self.cache_hits / max(1, self.milp_calls + self.cache_hits)) * 100
-        metrics.iterations_to_convergence = iterations
-        
-        return final_solution, self.calc.compute_transportation_cost(final_solution), {'metrics': metrics}
+                for c in route:
+                    final[len(final)] = [c]
+        return final
 
-class IALNS_NoCache(IALNSAlgorithm):
-    def __init__(self, instance_data: Dict, vehicle: Vehicle, params: Dict = None):
-        super().__init__(instance_data, vehicle, params)
+    def _best_feasible_split(self, route):
+        if len(route) <= 1:
+            return None
+        best, best_cost = None, float("inf")
+        for i in range(1, len(route)):
+            r1, r2 = route[:i], route[i:]
+            d1 = {c: self.instance_data["customers"][c]["demand"] for c in r1}
+            d2 = {c: self.instance_data["customers"][c]["demand"] for c in r2}
+            t1 = self.calc.compute_transportation_cost({0: r1})
+            t2 = self.calc.compute_transportation_cost({1: r2})
+            p1, _, _, h1 = self.saca.verify_route(r1, d1, transport_cost=t1,
+                                                   skip_sequence_check=True)
+            p2, _, _, h2 = self.saca.verify_route(r2, d2, transport_cost=t2,
+                                                   skip_sequence_check=True)
+            if h1 or h2:
+                continue
+            cost_split = (t1 + t2
+                          + (self.lambda_W + self.lambda_S) * (p1 + p2))
+            if cost_split < best_cost:
+                best_cost = cost_split
+                best = [r1, r2]
+        return best
+
+
+class SAALNS_NoCache(SAALNSAlgorithm):
+    def __init__(self, instance_data, vehicle, params=None, stability_weight=0.35):
+        super().__init__(instance_data, vehicle, params, stability_weight=stability_weight)
         self.feasibility_cache = {}
-        self.cache_hits = 0
-        
-    def _is_route_feasible_with_stability(self, route: List[int]) -> bool:
-        if not route:
-            return True
-        demands = self._extract_demands(route)
-        total_volume = sum(demands.values())
-        if total_volume > self.vehicle.max_volume:
-            return False
-        
-        self.milp_calls += 1
-        feasible, allocation = self.saca.solve_heuristic(demands, self.vehicle.product_densities)
-        
-        if feasible and allocation:
-            load = {c_id: allocation[c_id] * self.vehicle.product_densities.get(1, 0.8)
-                   for c_id in allocation if allocation[c_id] > 0}
-            ldd_result = LDDVerifier(self.vehicle).verify_load(load)
-            feasible = ldd_result.feasible and ldd_result.stability_margin > 5.0
-        
-        return feasible
+        new_saca = SACA(vehicle, instance_data,
+                        stability_weight=self.stability_weight,
+                        use_cache=False)
+        self.saca = new_saca
+        self.calc.saca = new_saca
 
-class IALNS_NoImbalance(IALNSAlgorithm):
-    def __init__(self, instance_data: Dict, vehicle: Vehicle, params: Dict = None):
-        super().__init__(instance_data, vehicle, params)
-        self.destroy_weights = {
-            'random': 1.0,
-            'worst': 1.2,
-            'compatibility': 1.0,
-            'shaw': 1.1
-        }
-        
-    def _apply_enhanced_destroy(self, solution: Dict[int, List[int]], operator: str) -> Tuple[Dict[int, List[int]], List[int]]:
-        if operator == 'random':
-            return self._destroy_random(solution)
-        elif operator == 'worst':
-            return self._destroy_worst_enhanced(solution)
-        elif operator == 'compatibility':
-            return self._destroy_compatibility(solution)
-        elif operator == 'shaw':
-            return self._destroy_shaw(solution)
-        return solution, []
+    def _route_penalty(self, route):
+        if not route:
+            return 0.0, False
+        self.feasibility_attempts += 1
+        demands_by_cust = {c: self.instance_data["customers"][c]["demand"] for c in route}
+        if not self.saca._sequence_feasible(route, demands_by_cust):
+            self.feasibility_failures += 1
+            return 1e6, True
+        travel = self.calc.compute_transportation_cost({0: route})
+        penalty, _, _, hard = self.saca.verify_route(
+            route, demands_by_cust, transport_cost=travel,
+            skip_sequence_check=True)
+        if hard or penalty > 1e-6:
+            self.feasibility_failures += 1
+        return penalty, hard
+
+
+class SAALNS_NoImbalance(SAALNSAlgorithm):
+    def __init__(self, instance_data, vehicle, params=None, stability_weight=0.35):
+        super().__init__(instance_data, vehicle, params, stability_weight=stability_weight)
+        self.destroy_weights = {"random": 1.0, "worst": 1.2,
+                                "compatibility": 1.0, "shaw": 1.1}
+
+
+class SAALNS_SingleProduct(SAALNSAlgorithm):
+    def __init__(self, instance_data, vehicle, params=None, stability_weight=0.35):
+        super().__init__(instance_data, vehicle, params,
+                         stability_weight=stability_weight)
+        new_saca = SACA_SingleProduct(
+            vehicle, instance_data,
+            stability_weight=self.stability_weight,
+            use_cache=True)
+        self.saca = new_saca
+        self.calc.saca = new_saca
 
 
 # ============================================================================
-# SENSITIVITY ANALYSIS MODULE
+# SMOKE TEST
+# ============================================================================
+
+def smoke_test(benchmark_dir, min_customers=20, tol=1e-6):
+    print("\nRunning smoke test ...")
+    candidates = []
+    for root, _, files in os.walk(benchmark_dir):
+        for f in files:
+            if f.endswith(".json"):
+                candidates.append(os.path.join(root, f))
+    if not candidates:
+        raise RuntimeError("No JSON instances found")
+    candidates.sort(key=lambda p: (len(json.load(open(p))["customers"]),
+                                   os.path.basename(p)))
+    smoke_file = None
+    for fp in candidates:
+        if len(json.load(open(fp))["customers"]) >= min_customers:
+            smoke_file = fp
+            break
+    if smoke_file is None:
+        raise RuntimeError(f"No instance with >= {min_customers} customers")
+
+    instance = json.load(open(smoke_file))
+    n = len(instance["customers"])
+    print(f"  Using {os.path.basename(smoke_file)} ({n} customers)")
+
+    vehicle = create_vehicle_from_instance(instance)
+    data = build_instance_data(instance)
+    calc = ObjectiveCalculator(data, vehicle)
+
+    trivial = sum(calc.compute_transportation_cost({i: [c]})
+                  for i, c in enumerate(range(n)))
+    print(f"  Trivial singleton cost: {trivial:.4f}")
+
+    algos = [("Standard_ALNS", StandardALNS),
+             ("FDAHS", FDAHSAlgorithm),
+             ("GCOF", GCOFAlgorithm),
+             ("HSA", HSAAlgorithm),
+             ("ACO_2opt", ACO2optAlgorithm)]
+    results = {}
+    for name, cls in algos:
+        seed = _stable_seed("smoke", name)
+        random.seed(seed)
+        np.random.seed(seed)
+        algo = cls(data, vehicle)
+        _, cost, _ = algo.solve()
+        results[name] = cost
+        flag = " <TRIVIAL>" if abs(cost - trivial) < 1e-3 else ""
+        print(f"  [smoke] {name:14s} -> {cost:.6f}{flag}")
+
+    names = list(results)
+    for i in range(len(names)):
+        for j in range(i + 1, len(names)):
+            if abs(results[names[i]] - results[names[j]]) < tol:
+                print(f"  [WARN] {names[i]} and {names[j]} agree to < {tol}")
+    return results
+
+
+# ============================================================================
+# LDD DIAGNOSTIC PROBE
+# ============================================================================
+
+def ldd_diagnostic_probe(benchmark_dir):
+    print("\n" + "=" * 80)
+    print("LDD DIAGNOSTIC PROBE")
+    print("=" * 80)
+    target = None
+    for root, _, files in os.walk(benchmark_dir):
+        if "P20_1.json" in files:
+            target = os.path.join(root, "P20_1.json")
+            break
+    if target is None:
+        print("  P20_1.json not found; skipping probe.")
+        return
+    inst = json.load(open(target))
+    vehicle = create_vehicle_from_instance(inst)
+    data = build_instance_data(inst)
+    saca = SACA(vehicle, data)
+
+    n = len(inst["customers"])
+    route = list(range(min(4, n)))
+    demands = {c: data["customers"][c]["demand"] for c in route}
+    travel = vehicle.fixed_cost
+    penalty, vol_alloc, prod_alloc, hard = saca.verify_route(
+        route, demands, transport_cost=travel)
+    print(f"  Route: {route}")
+    print(f"  hard-infeasible: {hard}")
+    print(f"  penalty: {penalty:.4f}")
+    load_kg = {cid: vol_alloc[cid] * 0.8 for cid in vol_alloc if vol_alloc[cid] > 0}
+    ldd = saca.ldd_verifier.verify_load(load_kg)
+    print(f"  cg_position      : {ldd.cg_position:.4f}")
+    print(f"  cg_min / cg_max  : {ldd.cg_min:.4f} / {ldd.cg_max:.4f}")
+    print(f"  cg_compliant     : {ldd.cg_compliant}")
+    print(f"  stability_margin : {ldd.stability_margin:.2f}%")
+    print(f"  violations       : {ldd.violations}")
+    print("=" * 80 + "\n")
+
+
+# ============================================================================
+# SENSITIVITY ANALYZER
 # ============================================================================
 
 class SensitivityAnalyzer:
-    def __init__(self, benchmark_dir: str, output_dir: str, 
-                 instance_subset: List[str] = None):
+    def __init__(self, benchmark_dir, output_dir):
         self.benchmark_dir = benchmark_dir
         self.output_dir = output_dir
-        self.instance_subset = instance_subset
-        os.makedirs(os.path.join(output_dir, 'part3_sensitivity'), exist_ok=True)
-        
-        self.lambda_H_values = [0.05, 0.075, 0.10, 0.125, 0.15]
-        self.lambda_W_values = [0.50, 0.75, 1.00, 1.25, 1.50]
-        self.lambda_S_values = [0.25, 0.375, 0.50, 0.625, 0.75]
-        
-        self.baseline_H = 0.10
-        self.baseline_W = 1.00
-        self.baseline_S = 0.50
-        
-        self.results: List[SensitivityResult] = []
-        
-    def load_instance(self, filepath: str) -> Dict:
-        with open(filepath, 'r') as f:
-            return json.load(f)
-    
-    def create_vehicle(self, instance: Dict) -> Vehicle:
-        vehicle_data = instance['vehicle']
-        compartments = [Compartment(
-            id=comp['id'],
-            capacity=comp['capacity'],
-            position_x=comp['position_x'],
-            position_y=comp['position_y'],
-            load_density=1.0
-        ) for comp in vehicle_data['compartments']]
-        
-        compartment_positions = {comp['id']: comp['position_x'] for comp in vehicle_data['compartments']}
-        
-        return Vehicle(
-            id=0,
-            compartments=compartments,
-            max_payload=vehicle_data['max_payload'],
-            front_axle_max=vehicle_data['front_axle_max'],
-            rear_axle_max=vehicle_data['rear_axle_max'],
-            wheelbase=vehicle_data['wheelbase'],
-            unladen_weight=vehicle_data['unladen_weight'],
-            max_volume=sum(c.capacity for c in compartments),
-            steering_min_ratio=vehicle_data['steering_min_ratio'],
-            driving_min_ratio=vehicle_data['driving_min_ratio'],
-            product_densities=vehicle_data.get('product_densities', {}),
-            fixed_cost=100.0,
-            cost_per_km=1.0,
-            front_axle_min=vehicle_data.get('front_axle_min', vehicle_data['front_axle_max'] * 0.1),
-            rear_axle_min=vehicle_data.get('rear_axle_min', vehicle_data['rear_axle_max'] * 0.1),
-            cg_min=vehicle_data.get('cg_min', 0.3 * vehicle_data['wheelbase']),
-            cg_max=vehicle_data.get('cg_max', 0.7 * vehicle_data['wheelbase']),
-            compartment_positions=compartment_positions,
-            is_multi_compartment=True
-        )
-    
-    def build_instance_data(self, instance: Dict) -> Dict:
-        n = len(instance['customers'])
-        coords = [[0, 0]] + [[c['x'], c['y']] for c in instance['customers']]
-        dist_matrix = [[math.sqrt((coords[i][0] - coords[j][0])**2 + 
-                                  (coords[i][1] - coords[j][1])**2) 
-                       for j in range(n + 1)] for i in range(n + 1)]
-        
-        return {
-            'name': instance['name'],
-            'customers': instance['customers'],
-            'time_windows': instance['time_windows'],
-            'distance_matrix': dist_matrix,
-            'vehicle': instance['vehicle'],
-            'n_products': instance.get('n_products', 3),
-            'n_customers': len(instance['customers']),
-            'n_compartments': instance.get('n_compartments', 
-                                           len(instance['vehicle']['compartments']))
-        }
-    
-    def create_ialns_with_params(self, instance_data: Dict, vehicle: Vehicle,
-                                  lambda_H: float, lambda_W: float, lambda_S: float) -> IALNSAlgorithm:
-        params = {
-            'max_iterations': 150,
-            'initial_temperature': 100.0,
-            'cooling_rate': 0.99,
-            'destruction_rate': 0.3,
-            'learning_rate': 0.15,
-            'stability_weight': lambda_S,
-            'distance_weight': 1.0 - lambda_S,
-            'tabu_tenure': 10,
-            'adaptive_frequency': 10,
-            'max_no_improvement': 50,
-            'cg_weight': 0.2,
-            'handling_cost_weight': lambda_H,
-            'overload_penalty_weight': lambda_W,
-        }
-        
-        return IALNSAlgorithm(instance_data, vehicle, params)
-    
-    def run_single_configuration(self, instance_file: str, lambda_H: float,
-                                  lambda_W: float, lambda_S: float, 
-                                  num_runs: int = 3) -> Optional[SensitivityResult]:
-        try:
-            instance = self.load_instance(instance_file)
-            vehicle = self.create_vehicle(instance)
-            instance_data = self.build_instance_data(instance)
-            
-            costs = []
-            stabilities = []
-            ldd_violations = []
-            fleet_sizes = []
-            cg_compliances = []
-            cpu_times = []
-            convergences = []
-            
-            for run in range(num_runs):
-                random.seed(42 + run * 7)
-                np.random.seed(42 + run * 7)
-                
-                algo = self.create_ialns_with_params(
-                    instance_data, vehicle, lambda_H, lambda_W, lambda_S
-                )
-                start_time = time.time()
-                solution, cost, extra = algo.solve()
-                elapsed = time.time() - start_time
-                
-                if solution:
-                    metrics = extra.get('metrics')
-                    if metrics is None:
-                        calc = ObjectiveCalculator(instance_data, vehicle)
-                        metrics = calc.compute_all_metrics(solution)
-                    
-                    costs.append(cost)
-                    stabilities.append(metrics.stability_margin)
-                    ldd_violations.append(metrics.ldd_violation_rate)
-                    fleet_sizes.append(metrics.fleet_size)
-                    cg_compliances.append(metrics.cg_compliance_rate)
-                    cpu_times.append(elapsed)
-                    
-                    if 'convergence' in extra:
-                        convergences.append(len(extra['convergence']))
-            
-            if costs:
-                param_id = f"H{lambda_H:.3f}_W{lambda_W:.3f}_S{lambda_S:.3f}"
-                return SensitivityResult(
-                    lambda_H=lambda_H,
-                    lambda_W=lambda_W,
-                    lambda_S=lambda_S,
-                    avg_cost=np.mean(costs),
-                    avg_stability=np.mean(stabilities),
-                    avg_ldd_violation=np.mean(ldd_violations),
-                    avg_fleet_size=np.mean(fleet_sizes),
-                    avg_cg_compliance=np.mean(cg_compliances),
-                    avg_cpu_time=np.mean(cpu_times),
-                    std_cost=np.std(costs),
-                    std_stability=np.std(stabilities),
-                    convergence_iterations=int(np.mean(convergences)) if convergences else 0,
-                    parameter_combination_id=param_id
-                )
-            return None
-            
-        except Exception as e:
-            print(f"    Error in configuration H={lambda_H}, W={lambda_W}, S={lambda_S}: {e}")
-            return None
-    
-    def run_sensitivity_analysis(self, max_instances: int = 10, 
-                                  num_runs: int = 3) -> pd.DataFrame:
+        self.lambda_W_values = [0.50, 1.00, 1.50]
+        self.lambda_S_values = [0.25, 0.50, 0.75]
+        self.baseline_W, self.baseline_S = 1.00, 0.50
+
+    def run_sensitivity_analysis(self, max_instances=5, num_runs=2):
         print("\n" + "=" * 80)
-        print("PART 3: SENSITIVITY ANALYSIS")
+        print("SENSITIVITY ANALYSIS (lambda_W, lambda_S)")
         print("=" * 80)
-        print(f"Testing {len(self.lambda_H_values)} × {len(self.lambda_W_values)} × "
-              f"{len(self.lambda_S_values)} = {len(self.lambda_H_values) * len(self.lambda_W_values) * len(self.lambda_S_values)} "
-              f"parameter combinations")
-        print(f"Parameters:")
-        print(f"  λ_H (Handling Cost): {self.lambda_H_values}")
-        print(f"  λ_W (Overload Penalty): {self.lambda_W_values}")
-        print(f"  λ_S (Stability Penalty): {self.lambda_S_values}")
-        print(f"  Baseline: λ_H={self.baseline_H}, λ_W={self.baseline_W}, λ_S={self.baseline_S}")
-        print("-" * 60)
-        
-        instance_files = []
-        for root, dirs, files in os.walk(self.benchmark_dir):
-            for file in files:
-                if file.endswith('.json'):
-                    instance_files.append(os.path.join(root, file))
-        
-        instance_files.sort(key=lambda x: os.path.basename(x))
-        
-        if max_instances > 0:
-            by_size = defaultdict(list)
-            for f in instance_files:
-                try:
-                    with open(f, 'r') as fp:
-                        data = json.load(fp)
-                        n = len(data.get('customers', []))
-                        if n <= 5:
-                            by_size['small'].append(f)
-                        elif n <= 10:
-                            by_size['medium'].append(f)
-                        else:
-                            by_size['large'].append(f)
-                except:
-                    continue
-            
-            selected = []
-            for size_category in ['small', 'medium', 'large']:
-                if by_size[size_category]:
-                    n_take = min(3, len(by_size[size_category]))
-                    selected.extend(by_size[size_category][:n_take])
-            
-            instance_files = selected if selected else instance_files[:max_instances]
-        
-        print(f"Using {len(instance_files)} instances for sensitivity analysis")
-        
-        all_results = []
-        total_combinations = len(self.lambda_H_values) * len(self.lambda_W_values) * len(self.lambda_S_values)
-        current = 0
-        
-        for lambda_H in self.lambda_H_values:
-            for lambda_W in self.lambda_W_values:
-                for lambda_S in self.lambda_S_values:
-                    current += 1
-                    print(f"\nTesting combination {current}/{total_combinations}: "
-                          f"λ_H={lambda_H:.3f}, λ_W={lambda_W:.3f}, λ_S={lambda_S:.3f}")
-                    
-                    combo_results = []
-                    for instance_file in instance_files:
-                        result = self.run_single_configuration(
-                            instance_file, lambda_H, lambda_W, lambda_S, num_runs
-                        )
-                        if result:
-                            combo_results.append(result)
-                    
-                    if combo_results:
-                        avg_result = self._average_sensitivity_results(combo_results)
-                        all_results.append(avg_result)
-        
-        df = self._results_to_dataframe(all_results)
-        
-        csv_path = os.path.join(self.output_dir, 'part3_sensitivity', 
-                                'sensitivity_analysis_results.csv')
-        df.to_csv(csv_path, index=False)
-        print(f"\nSensitivity analysis results saved to: {csv_path}")
-        
-        self._generate_sensitivity_figures(df)
-        
-        summary = self.generate_sensitivity_summary(df)
-        summary_df = pd.DataFrame([{
-            'Metric': k,
-            'Value': v if not isinstance(v, dict) else str(v)
-        } for k, v in summary.items()])
-        summary_df.to_csv(os.path.join(self.output_dir, 'part3_sensitivity', 
-                                       'sensitivity_summary.csv'), index=False)
-        
+        files = []
+        for root, _, fs in os.walk(self.benchmark_dir):
+            for f in fs:
+                if f.endswith(".json"):
+                    files.append(os.path.join(root, f))
+        files.sort(key=lambda x: os.path.basename(x))
+        if max_instances:
+            files = files[:max_instances]
+
+        results = []
+        total = len(self.lambda_W_values) * len(self.lambda_S_values)
+        ctr = 0
+        for lw in self.lambda_W_values:
+            for ls in self.lambda_S_values:
+                ctr += 1
+                print(f"  [{ctr}/{total}] W={lw} S={ls}")
+                costs, stabs, viols, fleets, cgs, cpus, convs = ([] for _ in range(7))
+                n_inf = 0
+                for fp in files:
+                    try:
+                        inst = json.load(open(fp))
+                    except Exception:
+                        continue
+                    vehicle = create_vehicle_from_instance(inst)
+                    data = build_instance_data(inst)
+                    for run in range(num_runs):
+                        seed = _stable_seed("sens", lw, ls, run, fp)
+                        random.seed(seed)
+                        np.random.seed(seed)
+                        params = {
+                            "max_iterations": 100,
+                            "initial_temperature": 100.0,
+                            "cooling_rate": 0.99,
+                            "destruction_rate": 0.3,
+                            "learning_rate": 0.15,
+                            "stability_weight": ls,
+                            "tabu_tenure": 10,
+                            "adaptive_frequency": 10,
+                            "max_no_improvement": 40,
+                        }
+                        try:
+                            algo = SAALNSAlgorithm(data, vehicle, params,
+                                                  stability_weight=ls)
+                            algo.lambda_W = lw
+                            algo.lambda_S = ls
+                            t0 = time.time()
+                            sol, cost, extra = algo.solve()
+                            elapsed = time.time() - t0
+                            if sol:
+                                m = extra.get("metrics")
+                                if m is None:
+                                    m = algo.calc.compute_all_metrics(
+                                        sol, lambda_W=lw, lambda_S=ls)
+                                if np.isfinite(m.penalised_cost):
+                                    costs.append(m.penalised_cost)
+                                    stabs.append(m.stability_margin)
+                                    viols.append(m.ldd_violation_rate)
+                                    fleets.append(m.fleet_size)
+                                    cgs.append(m.cg_compliance_rate)
+                                    cpus.append(elapsed)
+                                    convs.append(len(algo.convergence_history))
+                                else:
+                                    n_inf += 1
+                        except Exception:
+                            continue
+                if costs:
+                    results.append(SensitivityResult(
+                        lambda_W=lw, lambda_S=ls,
+                        avg_cost=float(np.mean(costs)),
+                        avg_stability=float(np.mean(stabs)),
+                        avg_ldd_violation=float(np.mean(viols)),
+                        avg_fleet_size=float(np.mean(fleets)),
+                        avg_cg_compliance=float(np.mean(cgs)),
+                        avg_cpu_time=float(np.mean(cpus)),
+                        std_cost=float(np.std(costs)),
+                        std_stability=float(np.std(stabs)),
+                        convergence_iterations=int(np.mean(convs)) if convs else 0,
+                        parameter_combination_id=f"W{lw}_S{ls}"))
+        df = pd.DataFrame([r.__dict__ for r in results])
+        out_csv = os.path.join(self.output_dir, "part3_sensitivity",
+                               "sensitivity_analysis_results.csv")
+        df.to_csv(out_csv, index=False)
+        print(f"\nSaved sensitivity results to {out_csv}")
+        if not df.empty:
+            print(df.to_string(index=False))
         return df
-    
-    def _average_sensitivity_results(self, results: List[SensitivityResult]) -> SensitivityResult:
-        if not results:
-            return None
-        
-        n = len(results)
-        return SensitivityResult(
-            lambda_H=results[0].lambda_H,
-            lambda_W=results[0].lambda_W,
-            lambda_S=results[0].lambda_S,
-            avg_cost=np.mean([r.avg_cost for r in results]),
-            avg_stability=np.mean([r.avg_stability for r in results]),
-            avg_ldd_violation=np.mean([r.avg_ldd_violation for r in results]),
-            avg_fleet_size=np.mean([r.avg_fleet_size for r in results]),
-            avg_cg_compliance=np.mean([r.avg_cg_compliance for r in results]),
-            avg_cpu_time=np.mean([r.avg_cpu_time for r in results]),
-            std_cost=np.std([r.std_cost for r in results]),
-            std_stability=np.std([r.std_stability for r in results]),
-            convergence_iterations=int(np.mean([r.convergence_iterations for r in results])),
-            parameter_combination_id=results[0].parameter_combination_id
-        )
-    
-    def _results_to_dataframe(self, results: List[SensitivityResult]) -> pd.DataFrame:
-        rows = []
-        for r in results:
-            row = {
-                'lambda_H': r.lambda_H,
-                'lambda_W': r.lambda_W,
-                'lambda_S': r.lambda_S,
-                'avg_cost': r.avg_cost,
-                'avg_stability': r.avg_stability,
-                'avg_ldd_violation': r.avg_ldd_violation,
-                'avg_fleet_size': r.avg_fleet_size,
-                'avg_cg_compliance': r.avg_cg_compliance,
-                'avg_cpu_time': r.avg_cpu_time,
-                'std_cost': r.std_cost,
-                'std_stability': r.std_stability,
-                'convergence_iterations': r.convergence_iterations,
-                'param_id': r.parameter_combination_id,
-                'is_baseline': (r.lambda_H == self.baseline_H and 
-                               r.lambda_W == self.baseline_W and 
-                               r.lambda_S == self.baseline_S)
-            }
-            rows.append(row)
-        
-        return pd.DataFrame(rows)
-    
-    def _generate_sensitivity_figures(self, df: pd.DataFrame):
-        output_dir = os.path.join(self.output_dir, 'part3_sensitivity')
-        
-        self._plot_sensitivity_heatmap(df, output_dir)
-        self._plot_parameter_impact(df, output_dir)
-        self._plot_stability_cost_tradeoff(df, output_dir)
-        self._plot_optimal_parameters(df, output_dir)
-        self._plot_convergence_sensitivity(df, output_dir)
-    
-    def _plot_sensitivity_heatmap(self, df: pd.DataFrame, output_dir: str):
-        fig, axes = plt.subplots(1, 3, figsize=(18, 5))
-        
-        lambda_S_values = sorted(df['lambda_S'].unique())
-        
-        for idx, lambda_S in enumerate(lambda_S_values[:3]):
-            subset = df[df['lambda_S'] == lambda_S]
-            if subset.empty:
-                continue
-            
-            pivot = subset.pivot(index='lambda_W', columns='lambda_H', values='avg_cost')
-            
-            im = axes[idx].imshow(pivot.values, cmap='RdYlGn_r', aspect='auto',
-                                  vmin=df['avg_cost'].min(), vmax=df['avg_cost'].max())
-            
-            axes[idx].set_xticks(range(len(pivot.columns)))
-            axes[idx].set_xticklabels([f'{x:.3f}' for x in pivot.columns])
-            axes[idx].set_yticks(range(len(pivot.index)))
-            axes[idx].set_yticklabels([f'{y:.3f}' for y in pivot.index])
-            axes[idx].set_xlabel('λ_H (Handling Cost)', fontsize=11)
-            axes[idx].set_ylabel('λ_W (Overload Penalty)', fontsize=11)
-            axes[idx].set_title(f'λ_S = {lambda_S:.3f}', fontsize=12)
-            
-            for i in range(len(pivot.index)):
-                for j in range(len(pivot.columns)):
-                    value = pivot.iloc[i, j]
-                    if not pd.isna(value):
-                        axes[idx].text(j, i, f'{value:.0f}', ha='center', va='center',
-                                       fontsize=8, color='black' if value < df['avg_cost'].mean() else 'white')
-        
-        plt.suptitle('Sensitivity Analysis: Cost Heatmap', fontsize=14)
-        plt.colorbar(im, ax=axes, label='Transportation Cost ($)')
-        plt.tight_layout()
-        plt.savefig(os.path.join(output_dir, 'Figure_S1_Sensitivity_Heatmap.pdf'), dpi=300)
-        plt.close()
-        print("  Generated: Figure_S1_Sensitivity_Heatmap")
-    
-    def _plot_parameter_impact(self, df: pd.DataFrame, output_dir: str):
-        fig, axes = plt.subplots(2, 3, figsize=(15, 10))
-        
-        parameters = [
-            ('lambda_H', 'λ_H (Handling Cost)'),
-            ('lambda_W', 'λ_W (Overload Penalty)'),
-            ('lambda_S', 'λ_S (Stability Penalty)')
-        ]
-        
-        for idx, (param, label) in enumerate(parameters):
-            grouped = df.groupby(param)['avg_cost'].agg(['mean', 'std']).reset_index()
-            ax = axes[0, idx]
-            ax.errorbar(grouped[param], grouped['mean'], yerr=grouped['std'],
-                       marker='o', capsize=4, linewidth=2, markersize=8, color='#2E86AB')
-            ax.set_xlabel(label, fontsize=11)
-            ax.set_ylabel('Average Cost ($)', fontsize=11)
-            ax.set_title(f'Cost vs {label}', fontsize=12)
-            ax.grid(True, alpha=0.3, linestyle='--')
-            
-            grouped = df.groupby(param)['avg_stability'].agg(['mean', 'std']).reset_index()
-            ax = axes[1, idx]
-            ax.errorbar(grouped[param], grouped['mean'], yerr=grouped['std'],
-                       marker='s', capsize=4, linewidth=2, markersize=8, color='#E76F51')
-            ax.set_xlabel(label, fontsize=11)
-            ax.set_ylabel('Stability Margin (%)', fontsize=11)
-            ax.set_title(f'Stability vs {label}', fontsize=12)
-            ax.grid(True, alpha=0.3, linestyle='--')
-            ax.axhline(y=5.0, color='red', linestyle='--', linewidth=1)
-        
-        plt.suptitle('Parameter Impact Analysis', fontsize=14)
-        plt.tight_layout()
-        plt.savefig(os.path.join(output_dir, 'Figure_S2_Parameter_Impact.pdf'), dpi=300)
-        plt.close()
-        print("  Generated: Figure_S2_Parameter_Impact")
-    
-    def _plot_stability_cost_tradeoff(self, df: pd.DataFrame, output_dir: str):
-        fig, ax = plt.subplots(figsize=(10, 8))
-        
-        scatter = ax.scatter(df['avg_cost'], df['avg_stability'], 
-                            c=df['lambda_S'], cmap='viridis', s=100, alpha=0.7)
-        
-        baseline = df[df['is_baseline']]
-        if not baseline.empty:
-            ax.scatter(baseline['avg_cost'], baseline['avg_stability'], 
-                      c='red', s=200, marker='*', label='Baseline', edgecolor='black', linewidth=2)
-        
-        ax.set_xlabel('Transportation Cost ($)', fontsize=12)
-        ax.set_ylabel('Stability Margin (%)', fontsize=12)
-        ax.set_title('Stability vs Cost Trade-off Across Parameter Configurations', fontsize=14)
-        ax.grid(True, alpha=0.3, linestyle='--')
-        ax.axhline(y=5.0, color='red', linestyle='--', linewidth=1, label='Safety Threshold')
-        
-        cbar = plt.colorbar(scatter, ax=ax)
-        cbar.set_label('λ_S (Stability Penalty)', fontsize=11)
-        
-        self._annotate_pareto_frontier(df, ax)
-        ax.legend(loc='upper right')
-        plt.tight_layout()
-        plt.savefig(os.path.join(output_dir, 'Figure_S3_Stability_Cost_Tradeoff.pdf'), dpi=300)
-        plt.close()
-        print("  Generated: Figure_S3_Stability_Cost_Tradeoff")
-    
-    def _annotate_pareto_frontier(self, df: pd.DataFrame, ax):
-        points = df[['avg_cost', 'avg_stability']].values
-        pareto = []
-        for i, p in enumerate(points):
-            dominated = False
-            for j, q in enumerate(points):
-                if i != j:
-                    if q[0] <= p[0] and q[1] >= p[1] and (q[0] < p[0] or q[1] > p[1]):
-                        dominated = True
-                        break
-            if not dominated:
-                pareto.append(i)
-        
-        if pareto:
-            pareto_points = points[pareto]
-            pareto_points = pareto_points[pareto_points[:, 0].argsort()]
-            ax.plot(pareto_points[:, 0], pareto_points[:, 1], 'k--', linewidth=2, label='Pareto Frontier')
-            
-            for idx in pareto[:5]:
-                row = df.iloc[idx]
-                label = f"λH={row['lambda_H']:.2f}\nλW={row['lambda_W']:.2f}\nλS={row['lambda_S']:.2f}"
-                ax.annotate(label, xy=(row['avg_cost'], row['avg_stability']),
-                           xytext=(5, 5), textcoords='offset points', fontsize=7,
-                           bbox=dict(boxstyle='round,pad=0.3', facecolor='white', alpha=0.8))
-    
-    def _plot_optimal_parameters(self, df: pd.DataFrame, output_dir: str):
-        fig, axes = plt.subplots(1, 2, figsize=(14, 5))
-        
-        normalized_cost = (df['avg_cost'] - df['avg_cost'].min()) / (df['avg_cost'].max() - df['avg_cost'].min())
-        normalized_stability = (df['avg_stability'] - df['avg_stability'].min()) / (df['avg_stability'].max() - df['avg_stability'].min())
-        combined_score = 0.6 * (1 - normalized_cost) + 0.4 * normalized_stability
-        
-        df = df.copy()
-        df['combined_score'] = combined_score
-        
-        top_configs = df.nlargest(10, 'combined_score')
-        
-        ax = axes[0]
-        x = range(len(top_configs))
-        bars = ax.bar(x, top_configs['combined_score'], color='#2E86AB')
-        ax.set_xlabel('Configuration Rank', fontsize=12)
-        ax.set_ylabel('Combined Score', fontsize=12)
-        ax.set_title('Top 10 Parameter Configurations', fontsize=12)
-        ax.set_xticks(x)
-        ax.set_xticklabels([f"{i+1}" for i in range(len(top_configs))])
-        ax.grid(True, alpha=0.3, linestyle='--', axis='y')
-        
-        for i, (_, row) in enumerate(top_configs.iterrows()):
-            label = f"λH={row['lambda_H']:.2f}\nλW={row['lambda_W']:.2f}\nλS={row['lambda_S']:.2f}"
-            ax.text(i, row['combined_score'] + 0.02, label, ha='center', va='bottom', fontsize=7)
-        
-        baseline_idx = top_configs[top_configs['is_baseline']].index
-        if not baseline_idx.empty and len(baseline_idx) > 0:
-            pos = top_configs.index.get_loc(baseline_idx[0])
-            bars[pos].set_color('red')
-            ax.text(pos, top_configs.loc[baseline_idx[0], 'combined_score'] + 0.05, 
-                   'BASELINE', ha='center', va='bottom', fontsize=8, fontweight='bold', color='red')
-        
-        ax = axes[1]
-        param_ranges = {
-            'λ_H': top_configs['lambda_H'].values,
-            'λ_W': top_configs['lambda_W'].values,
-            'λ_S': top_configs['lambda_S'].values
-        }
-        
-        ax.boxplot([param_ranges['λ_H'], param_ranges['λ_W'], param_ranges['λ_S']],
-                  labels=['λ_H', 'λ_W', 'λ_S'])
-        ax.set_ylabel('Parameter Value', fontsize=12)
-        ax.set_title('Parameter Distribution in Top Configurations', fontsize=12)
-        ax.grid(True, alpha=0.3, linestyle='--', axis='y')
-        
-        ax.axhline(y=0.10, color='blue', linestyle='--', linewidth=1, alpha=0.5, label='λ_H Baseline')
-        ax.axhline(y=1.00, color='green', linestyle='--', linewidth=1, alpha=0.5, label='λ_W Baseline')
-        ax.axhline(y=0.50, color='orange', linestyle='--', linewidth=1, alpha=0.5, label='λ_S Baseline')
-        ax.legend(fontsize=8)
-        
-        plt.suptitle('Optimal Parameter Identification', fontsize=14)
-        plt.tight_layout()
-        plt.savefig(os.path.join(output_dir, 'Figure_S4_Optimal_Parameters.pdf'), dpi=300)
-        plt.close()
-        print("  Generated: Figure_S4_Optimal_Parameters")
-    
-    def _plot_convergence_sensitivity(self, df: pd.DataFrame, output_dir: str):
-        fig, ax = plt.subplots(figsize=(10, 6))
-        
-        parameters = [
-            ('lambda_H', 'λ_H (Handling Cost)'),
-            ('lambda_W', 'λ_W (Overload Penalty)'),
-            ('lambda_S', 'λ_S (Stability Penalty)')
-        ]
-        
-        x_positions = []
-        x_labels = []
-        y_values = []
-        y_errors = []
-        colors = []
-        
-        for param, label in parameters:
-            grouped = df.groupby(param)['convergence_iterations'].agg(['mean', 'std']).reset_index()
-            for _, row in grouped.iterrows():
-                x_positions.append(len(x_positions))
-                x_labels.append(f"{row[param]:.3f}")
-                y_values.append(row['mean'])
-                y_errors.append(row['std'])
-                if param == 'lambda_H':
-                    colors.append('#2E86AB')
-                elif param == 'lambda_W':
-                    colors.append('#E76F51')
-                else:
-                    colors.append('#1A7A5A')
-        
-        bars = ax.bar(x_positions, y_values, yerr=y_errors, capsize=5, color=colors, alpha=0.8)
-        ax.set_xlabel('Parameter Value', fontsize=12)
-        ax.set_ylabel('Convergence Iterations', fontsize=12)
-        ax.set_title('Parameter Impact on Convergence Speed', fontsize=14)
-        ax.set_xticks(x_positions)
-        ax.set_xticklabels(x_labels, rotation=45, ha='right')
-        ax.grid(True, alpha=0.3, linestyle='--', axis='y')
-        
-        from matplotlib.patches import Patch
-        legend_elements = [
-            Patch(facecolor='#2E86AB', label='λ_H'),
-            Patch(facecolor='#E76F51', label='λ_W'),
-            Patch(facecolor='#1A7A5A', label='λ_S')
-        ]
-        ax.legend(handles=legend_elements, loc='upper right')
-        
-        plt.tight_layout()
-        plt.savefig(os.path.join(output_dir, 'Figure_S5_Convergence_Sensitivity.pdf'), dpi=300)
-        plt.close()
-        print("  Generated: Figure_S5_Convergence_Sensitivity")
-    
-    def generate_sensitivity_summary(self, df: pd.DataFrame) -> Dict:
-        baseline = df[df['is_baseline']]
-        
-        summary = {
-            'baseline_cost': baseline['avg_cost'].mean() if not baseline.empty else None,
-            'baseline_stability': baseline['avg_stability'].mean() if not baseline.empty else None,
-            'min_cost': df['avg_cost'].min(),
-            'max_cost': df['avg_cost'].max(),
-            'min_stability': df['avg_stability'].min(),
-            'max_stability': df['avg_stability'].max(),
-            'optimal_cost_config': {
-                'lambda_H': df.loc[df['avg_cost'].idxmin()]['lambda_H'],
-                'lambda_W': df.loc[df['avg_cost'].idxmin()]['lambda_W'],
-                'lambda_S': df.loc[df['avg_cost'].idxmin()]['lambda_S'],
-                'cost': df['avg_cost'].min(),
-                'stability': df.loc[df['avg_cost'].idxmin()]['avg_stability']
-            },
-            'optimal_stability_config': {
-                'lambda_H': df.loc[df['avg_stability'].idxmax()]['lambda_H'],
-                'lambda_W': df.loc[df['avg_stability'].idxmax()]['lambda_W'],
-                'lambda_S': df.loc[df['avg_stability'].idxmax()]['lambda_S'],
-                'cost': df.loc[df['avg_stability'].idxmax()]['avg_cost'],
-                'stability': df['avg_stability'].max()
-            },
-            'parameter_sensitivity': {}
-        }
-        
-        for param in ['lambda_H', 'lambda_W', 'lambda_S']:
-            grouped = df.groupby(param)['avg_cost'].agg(['mean', 'std'])
-            sensitivity = (grouped['mean'].max() - grouped['mean'].min()) / grouped['mean'].mean()
-            summary['parameter_sensitivity'][param] = sensitivity
-        
-        return summary
 
 
 # ============================================================================
-# EXPERIMENTAL COMPARISON - PART 1: SOTA
+# SOTA COMPARISON
 # ============================================================================
+
+def _finite_mean(series):
+    s = pd.Series(series).replace([np.inf, -np.inf], np.nan).dropna()
+    return float(s.mean()) if len(s) > 0 else float("nan")
+
+
+def _finite_std(series):
+    s = pd.Series(series).replace([np.inf, -np.inf], np.nan).dropna()
+    return float(s.std(ddof=1)) if len(s) > 1 else 0.0
+
 
 class SOTAComparison:
-    def __init__(self, benchmark_dir: str, output_dir: str):
+    def __init__(self, benchmark_dir, output_dir):
         self.benchmark_dir = benchmark_dir
         self.output_dir = output_dir
-        os.makedirs(output_dir, exist_ok=True)
-        self.results = []
-        
         self.algorithms = {
-            'IALNS': IALNSAlgorithm,
-            'Standard_ALNS': StandardALNS,
-            'FDAHS': FDAHSAlgorithm,
-            'GCOF': GCOFAlgorithm,
-            'HSA': HSAAlgorithm,
-            'ACO_2opt': ACO2optAlgorithm,
+            "SA-ALNS": SAALNSAlgorithm,
+            "SA-ALNS_CostOnly": SAALNS_NoStability,
+            "Standard_ALNS": StandardALNS,
+            "FDAHS": FDAHSAlgorithm,
+            "GCOF": GCOFAlgorithm,
+            "HSA": HSAAlgorithm,
+            "ACO_2opt": ACO2optAlgorithm,
         }
-        
-    def load_instance(self, filepath: str) -> Dict:
-        with open(filepath, 'r') as f:
-            return json.load(f)
-    
-    def create_vehicle(self, instance: Dict, multi_compartment: bool = True) -> Vehicle:
-        vehicle_data = instance['vehicle']
-        compartments = [Compartment(
-            id=comp['id'],
-            capacity=comp['capacity'],
-            position_x=comp['position_x'],
-            position_y=comp['position_y'],
-            load_density=1.0
-        ) for comp in vehicle_data['compartments']]
-        
-        compartment_positions = {comp['id']: comp['position_x'] for comp in vehicle_data['compartments']}
-        
-        if not multi_compartment:
-            total_capacity = sum(c['capacity'] for c in compartments)
-            avg_position = np.mean([c.position_x for c in compartments])
-            compartments = [Compartment(id=0, capacity=total_capacity, position_x=avg_position, position_y=0.0, load_density=1.0)]
-            compartment_positions = {0: avg_position}
-        
-        return Vehicle(
-            id=0,
-            compartments=compartments,
-            max_payload=vehicle_data['max_payload'],
-            front_axle_max=vehicle_data['front_axle_max'],
-            rear_axle_max=vehicle_data['rear_axle_max'],
-            wheelbase=vehicle_data['wheelbase'],
-            unladen_weight=vehicle_data['unladen_weight'],
-            max_volume=sum(c.capacity for c in compartments),
-            steering_min_ratio=vehicle_data['steering_min_ratio'],
-            driving_min_ratio=vehicle_data['driving_min_ratio'],
-            product_densities=vehicle_data.get('product_densities', {}),
-            fixed_cost=100.0,
-            cost_per_km=1.0,
-            front_axle_min=vehicle_data.get('front_axle_min', vehicle_data['front_axle_max'] * 0.1),
-            rear_axle_min=vehicle_data.get('rear_axle_min', vehicle_data['rear_axle_max'] * 0.1),
-            cg_min=vehicle_data.get('cg_min', 0.3 * vehicle_data['wheelbase']),
-            cg_max=vehicle_data.get('cg_max', 0.7 * vehicle_data['wheelbase']),
-            compartment_positions=compartment_positions,
-            is_multi_compartment=multi_compartment
-        )
-    
-    def build_instance_data(self, instance: Dict) -> Dict:
-        n = len(instance['customers'])
-        coords = [[0, 0]] + [[c['x'], c['y']] for c in instance['customers']]
-        dist_matrix = [[math.sqrt((coords[i][0] - coords[j][0])**2 + (coords[i][1] - coords[j][1])**2) 
-                       for j in range(n + 1)] for i in range(n + 1)]
-        
-        return {
-            'name': instance['name'],
-            'customers': instance['customers'],
-            'time_windows': instance['time_windows'],
-            'distance_matrix': dist_matrix,
-            'vehicle': instance['vehicle'],
-            'n_products': instance.get('n_products', 3),
-            'n_customers': len(instance['customers']),
-            'n_compartments': instance.get('n_compartments', len(instance['vehicle']['compartments']))
-        }
-    
-    def run_single_instance(self, instance_file: str, num_runs: int = 3, 
-                           multi_compartment: bool = True) -> Dict:
-        instance = self.load_instance(instance_file)
-        vehicle = self.create_vehicle(instance, multi_compartment)
-        instance_data = self.build_instance_data(instance)
-        
-        results = {
-            'instance': instance['name'],
-            'n_customers': len(instance['customers']),
-            'n_compartments': instance.get('n_compartments', len(instance['vehicle']['compartments'])),
-            'layer': instance.get('layer', 'Unknown'),
-            'n_products': instance.get('n_products', 3),
-            'vehicle_type': 'Multi-Compartment' if multi_compartment else 'Single-Compartment',
-            'results': {}
-        }
-        
-        print(f"\n  Testing on {instance['name']} ({len(instance['customers'])} customers, "
-              f"{instance.get('n_products', 3)} commodities, {results['n_compartments']} compartments, {results['vehicle_type']})")
-        
-        for algo_name, algo_class in self.algorithms.items():
-            print(f"    Running {algo_name}...", end='', flush=True)
-            costs = []
-            times = []
-            metrics_list = []
-            
+
+    def run_all_instances(self, max_instances=None):
+        files = []
+        for root, _, fs in os.walk(self.benchmark_dir):
+            for f in fs:
+                if f.endswith(".json"):
+                    files.append(os.path.join(root, f))
+        files.sort(key=lambda p: (
+            len(json.load(open(p))["customers"]), os.path.basename(p)))
+        if max_instances:
+            files = files[:max_instances]
+
+        smoke_test(self.benchmark_dir)
+        ldd_diagnostic_probe(self.benchmark_dir)
+
+        print(f"\nSOTA COMPARISON: {len(files)} instances")
+        all_results = []
+        for i, fp in enumerate(files):
+            print(f"\n[{i+1}/{len(files)}] {os.path.basename(fp)}")
+            try:
+                all_results.append(self.run_one(fp))
+            except Exception as e:
+                print(f"  Skipped: {e}")
+
+        df = self._to_df(all_results)
+        if not df.empty:
+            df.to_csv(os.path.join(self.output_dir, "sota_comparison_results.csv"),
+                      index=False)
+        return df
+
+    def run_one(self, fp, num_runs=1):
+        instance = json.load(open(fp))
+        vehicle = create_vehicle_from_instance(instance)
+        data = build_instance_data(instance)
+        n_expected = len(instance["customers"])
+        out = {"instance": instance["name"],
+               "n_customers": n_expected,
+               "n_compartments": instance.get("n_compartments",
+                                               len(instance["vehicle"]["compartments"])),
+               "layer": instance.get("layer", "Unknown"),
+               "n_products": instance.get("n_products", 4),
+               "vehicle_type": "Multi-Compartment",
+               "results": {}}
+        for name, cls in self.algorithms.items():
+            print(f"    {name}...", end="", flush=True)
+            costs, times, t_milp, metrics = [], [], [], []
+            n_infeasible = 0
             for run in range(num_runs):
+                seed = _stable_seed(name, run, instance["name"])
+                random.seed(seed)
+                np.random.seed(seed)
                 try:
-                    random.seed(42 + run * 7)
-                    np.random.seed(42 + run * 7)
-                    algo = algo_class(instance_data, vehicle)
-                    start_time = time.time()
-                    solution, cost, extra = algo.solve()
-                    elapsed = time.time() - start_time
-                    
-                    if solution:
-                        if 'metrics' in extra and extra['metrics'] is not None:
-                            metrics = extra['metrics']
+                    algo = cls(data, vehicle)
+                    t0 = time.time()
+                    sol, cost, extra = algo.solve()
+                    elapsed = time.time() - t0
+                    if sol:
+                        n_in = sum(len(r) for r in sol.values() if r)
+                        if n_in != n_expected:
+                            print(f" [ALERT {name}: {n_in}/{n_expected} customers]",
+                                  end="")
+                        m = extra.get("metrics")
+                        if m is None:
+                            m = algo.calc.compute_all_metrics(
+                                sol, lambda_W=algo.lambda_W, lambda_S=algo.lambda_S)
+                        if np.isfinite(m.penalised_cost):
+                            costs.append(m.penalised_cost)
+                            times.append(elapsed)
+                            t_milp.append(m.milp_time)
+                            metrics.append(m)
                         else:
-                            calc = ObjectiveCalculator(instance_data, vehicle)
-                            metrics = calc.compute_all_metrics(solution)
-                        
-                        costs.append(cost)
-                        times.append(elapsed)
-                        metrics_list.append(metrics)
+                            n_infeasible += 1
+                            times.append(elapsed)
+                            t_milp.append(m.milp_time)
+                            metrics.append(m)
                 except Exception as e:
-                    print(f"\n      Error in run {run}: {e}")
-                    continue
-            
-            if costs:
-                avg_metrics = self._average_metrics(metrics_list)
-                results['results'][algo_name] = {
-                    # Economic Efficiency
-                    'avg_cost': np.mean(costs),
-                    'std_cost': np.std(costs),
-                    'best_cost': min(costs),
-                    'worst_cost': max(costs),
-                    'avg_total_distance': avg_metrics.total_distance,
-                    'avg_fleet_size': avg_metrics.fleet_size,
-                    'avg_fleet_utilization': avg_metrics.fleet_utilization,
-                    'avg_volume_utilization': avg_metrics.volume_utilization,
-                    
-                    # Safety Compliance
-                    'avg_ldd_violation_rate': avg_metrics.ldd_violation_rate,
-                    'avg_stability': avg_metrics.stability_margin,
-                    'avg_minimum_load_ratio': avg_metrics.minimum_load_ratio,
-                    'avg_slosh_risk': avg_metrics.slosh_risk_score,
-                    
-                    # Computational Performance
-                    'avg_time': np.mean(times),
-                    'std_time': np.std(times),
-                    'avg_cpu_time': avg_metrics.cpu_time,
-                    'avg_saca_calls': avg_metrics.saca_calls,
-                    'avg_cache_hit_rate': avg_metrics.cache_hit_rate,
-                    'avg_iterations_to_convergence': avg_metrics.iterations_to_convergence,
-                    
-                    # CG Metrics
-                    'avg_cg_position': avg_metrics.cg_position_mean,
-                    'avg_cg_compliance_rate': avg_metrics.cg_compliance_rate,
-                    'avg_cg_deviation': avg_metrics.cg_deviation_from_optimum,
-                    'avg_heeling_moment': avg_metrics.heeling_moment_estimate,
-                    'avg_lateral_margin': avg_metrics.lateral_acceleration_margin
+                    print(f" [err {e}]", end="")
+            if metrics:
+                avg = self._avg_metrics(metrics)
+                mean_calls = float(avg.milp_calls)
+                mean_milp_time = float(np.mean(t_milp)) if t_milp else 0.0
+                per_call = (mean_milp_time / mean_calls) if mean_calls > 0 else float("nan")
+                finite_costs = [c for c in costs if np.isfinite(c)]
+                infeas_rate = 100.0 * n_infeasible / max(len(metrics), 1)
+                out["results"][name] = {
+                    "avg_cost": float(np.mean(finite_costs)) if finite_costs else float("inf"),
+                    "std_cost": float(np.std(finite_costs, ddof=1)) if len(finite_costs) > 1 else 0.0,
+                    "best_cost": float(min(finite_costs)) if finite_costs else float("inf"),
+                    "worst_cost": float(max(finite_costs)) if finite_costs else float("inf"),
+                    "n_finite_runs": len(finite_costs),
+                    "n_infeasible_runs": n_infeasible,
+                    "infeasibility_rate_pct": infeas_rate,
+                    "avg_routing_time": float(np.mean(times)) if times else 0.0,
+                    "avg_milp_time": mean_milp_time,
+                    "avg_total_time": float(np.mean(times)) if times else 0.0,
+                    "avg_milp_calls": avg.milp_calls,
+                    "avg_milp_time_per_call": per_call,
+                    "milp_time_fraction": (
+                        mean_milp_time /
+                        max(float(np.mean(times)) if times else 1e-9, 1e-9)),
+                    "avg_saca_calls": avg.milp_calls,
+                    "avg_cache_hit_rate": avg.cache_hit_rate,
+                    "avg_route_penalty_cache_hits": avg.route_penalty_cache_hits,
+                    "avg_route_penalty_cache_hit_rate": avg.route_penalty_cache_hit_rate,
+                    "avg_ldd_violation_rate": avg.ldd_violation_rate,
+                    "avg_stability": avg.stability_margin,
+                    "avg_slosh_risk": avg.slosh_risk_score,
+                    "avg_cg_compliance_rate": avg.cg_compliance_rate,
+                    "avg_cg_deviation": avg.cg_deviation_from_optimum,
+                    "avg_volume_utilization": avg.volume_utilization,
+                    "avg_fleet_size": avg.fleet_size,
+                    "avg_feasibility_failures": avg.feasibility_failures,
+                    "avg_feasibility_attempts": avg.feasibility_attempts,
+                    "feasibility_failure_rate": (
+                        100.0 * avg.feasibility_failures /
+                        max(1, avg.feasibility_attempts)),
+                    "avg_penalty": avg.avg_penalty,
+                    "avg_n_total_routes": float(avg.n_total_routes),
+                    "avg_n_verified_routes": float(avg.n_verified_routes),
                 }
-                print(f" done (avg cost: {np.mean(costs):.2f})", flush=True)
+                c = out["results"][name]["avg_cost"]
+                print(f" done ({c:.2f})" if np.isfinite(c) else " done (inf)", flush=True)
             else:
                 print(" failed", flush=True)
-        
-        return results
-    
-    def _average_metrics(self, metrics_list: List[PerformanceMetrics]) -> PerformanceMetrics:
-        if not metrics_list:
-            return PerformanceMetrics(
-                total_distance=0,
-                transportation_cost=0,
-                fleet_size=0,
-                fleet_utilization=0,
-                volume_utilization=0,
-                ldd_violation_rate=0,
-                stability_margin=0,
-                minimum_load_ratio=0,
-                slosh_risk_score=0,
-                cpu_time=0,
-                saca_calls=0,
-                cache_hit_rate=0,
-                iterations_to_convergence=0
-            )
-        
-        avg = PerformanceMetrics(
-            total_distance=0,
-            transportation_cost=0,
-            fleet_size=0,
-            fleet_utilization=0,
-            volume_utilization=0,
-            ldd_violation_rate=0,
-            stability_margin=0,
-            minimum_load_ratio=0,
-            slosh_risk_score=0,
-            cpu_time=0,
-            saca_calls=0,
-            cache_hit_rate=0,
-            iterations_to_convergence=0
-        )
-        
-        for m in metrics_list:
-            avg.total_distance += m.total_distance
-            avg.transportation_cost += m.transportation_cost
-            avg.fleet_size += m.fleet_size
-            avg.fleet_utilization += m.fleet_utilization
-            avg.volume_utilization += m.volume_utilization
-            avg.ldd_violation_rate += m.ldd_violation_rate
-            avg.stability_margin += m.stability_margin
-            avg.minimum_load_ratio += m.minimum_load_ratio
-            avg.slosh_risk_score += m.slosh_risk_score
-            avg.cpu_time += m.cpu_time
-            avg.saca_calls += m.saca_calls
-            avg.cache_hit_rate += m.cache_hit_rate
-            avg.iterations_to_convergence += m.iterations_to_convergence
-            avg.cg_position_mean += m.cg_position_mean
-            avg.cg_position_std += m.cg_position_std
-            avg.cg_position_min += m.cg_position_min
-            avg.cg_position_max += m.cg_position_max
-            avg.cg_compliance_rate += m.cg_compliance_rate
-            avg.cg_deviation_from_optimum += m.cg_deviation_from_optimum
-            avg.heeling_moment_estimate += m.heeling_moment_estimate
-            avg.lateral_acceleration_margin += m.lateral_acceleration_margin
-        
-        n = len(metrics_list)
-        if n > 0:
-            for attr in ['total_distance', 'transportation_cost', 'fleet_size', 'fleet_utilization',
-                        'volume_utilization', 'ldd_violation_rate', 'stability_margin', 
-                        'minimum_load_ratio', 'slosh_risk_score', 'cpu_time', 'saca_calls',
-                        'cache_hit_rate', 'iterations_to_convergence', 'cg_position_mean',
-                        'cg_position_std', 'cg_position_min', 'cg_position_max',
-                        'cg_compliance_rate', 'cg_deviation_from_optimum', 
-                        'heeling_moment_estimate', 'lateral_acceleration_margin']:
-                if hasattr(avg, attr):
-                    setattr(avg, attr, getattr(avg, attr) / n)
-        
+        return out
+
+    def _avg_metrics(self, metrics):
+        if not metrics:
+            return PerformanceMetrics(0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0)
+        avg = PerformanceMetrics(0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0)
+        attrs = ["total_distance", "transportation_cost", "fleet_size",
+                 "fleet_utilization", "volume_utilization", "ldd_violation_rate",
+                 "stability_margin", "minimum_load_ratio", "slosh_risk_score",
+                 "cpu_time", "saca_calls", "cache_hit_rate",
+                 "iterations_to_convergence", "milp_calls", "cache_hits",
+                 "milp_time", "routing_time", "feasibility_failures",
+                 "feasibility_attempts", "cg_position_mean", "cg_position_std",
+                 "cg_position_min", "cg_position_max", "cg_compliance_rate",
+                 "cg_deviation_from_optimum", "heeling_moment_estimate",
+                 "lateral_acceleration_margin", "penalised_cost", "avg_penalty",
+                 "n_total_routes", "n_verified_routes",
+                 "route_penalty_cache_hits", "route_penalty_cache_hit_rate"]
+        n = len(metrics)
+        for m in metrics:
+            for a in attrs:
+                setattr(avg, a, getattr(avg, a) + getattr(m, a, 0))
+        for a in attrs:
+            setattr(avg, a, getattr(avg, a) / n)
+        for a in ["cg_compliance_rate", "fleet_utilization",
+                  "volume_utilization", "ldd_violation_rate",
+                  "stability_margin", "minimum_load_ratio", "cache_hit_rate",
+                  "route_penalty_cache_hit_rate"]:
+            setattr(avg, a, max(0.0, min(100.0, getattr(avg, a))))
         return avg
-    
-    def run_all_instances(self, max_instances: int = None) -> pd.DataFrame:
-        instance_files = []
-        for root, dirs, files in os.walk(self.benchmark_dir):
-            for file in files:
-                if file.endswith('.json'):
-                    instance_files.append(os.path.join(root, file))
-        
-        instance_files.sort(key=lambda x: os.path.basename(x))
-        
-        if max_instances:
-            instance_files = instance_files[:max_instances]
-        
-        print(f"\nPART 1: SOTA COMPARISON (6 Algorithms)")
-        print(f"Found {len(instance_files)} instance files")
-        print(f"Algorithms:")
-        print("  1. IALNS (Proposed) - Adaptive weights + enhanced operators")
-        print("  2. Standard_ALNS - Standard baseline (no adaptive)")
-        print("  3. FDAHS - Feasibility-Driven Anytime Hybrid Search (2026)")
-        print("  4. GCOF - Guided Collaborative Optimization Framework (2026)")
-        print("  5. HSA - Hybrid Simulated Annealing (2023)")
-        print("  6. ACO_2opt - Ant Colony Optimization with 2-Opt (2015)")
-        print("-" * 60)
-        
-        all_results = []
-        for i, filepath in enumerate(instance_files):
-            print(f"\nProcessing {i+1}/{len(instance_files)}: {os.path.basename(filepath)}")
-            try:
-                result = self.run_single_instance(filepath, num_runs=3)
-                all_results.append(result)
-            except Exception as e:
-                print(f"  Error: {e}")
-                continue
-        
-        df = self._results_to_dataframe(all_results)
-        if not df.empty:
-            csv_path = os.path.join(self.output_dir, 'sota_comparison_results.csv')
-            df.to_csv(csv_path, index=False)
-            print(f"\nSOTA results saved to: {csv_path}")
-        return df
-    
-    def _results_to_dataframe(self, results: List[Dict]) -> pd.DataFrame:
+
+    def _to_df(self, results):
         rows = []
-        for result in results:
-            if not result['results']:
+        for r in results:
+            if not r["results"]:
                 continue
-            base_row = {
-                'instance': result['instance'],
-                'n_customers': result['n_customers'],
-                'n_compartments': result.get('n_compartments', 0),
-                'layer': result.get('layer', 'Unknown'),
-                'n_products': result.get('n_products', 3),
-                'vehicle_type': result.get('vehicle_type', 'Multi-Compartment')
-            }
-            for algo, data in result['results'].items():
-                row = base_row.copy()
-                row['algorithm'] = algo
-                for key, value in data.items():
-                    row[key] = value
+            base = {k: r[k] for k in ("instance", "n_customers", "n_compartments",
+                                       "layer", "n_products", "vehicle_type")}
+            for algo, d in r["results"].items():
+                row = dict(base)
+                row["algorithm"] = algo
+                row.update(d)
                 rows.append(row)
         return pd.DataFrame(rows)
 
 
-# ============================================================================
-# ABLATION COMPARISON
-# ============================================================================
-
-class AblationComparison:
-    def __init__(self, benchmark_dir: str, output_dir: str):
-        self.benchmark_dir = benchmark_dir
-        self.output_dir = output_dir
-        os.makedirs(output_dir, exist_ok=True)
-        self.results = []
-        
+class AblationComparison(SOTAComparison):
+    def __init__(self, benchmark_dir, output_dir):
+        super().__init__(benchmark_dir, output_dir)
         self.algorithms = {
-            'IALNS': IALNSAlgorithm,
-            'IALNS_NS': IALNS_NoStability,
-            'IALNS_NA': IALNS_NoAdaptive,
-            'IALNS_SEQ': IALNS_Sequential,
-            'IALNS_NC': IALNS_NoCache,
-            'IALNS_IMB': IALNS_NoImbalance,
+            "SA-ALNS": SAALNSAlgorithm,
+            "SA-ALNS_NS": SAALNS_NoStability,
+            "SA-ALNS_NA": SAALNS_NoAdaptive,
+            "SA-ALNS_SEQ": SAALNS_Sequential,
+            "SA-ALNS_NC": SAALNS_NoCache,
+            "SA-ALNS_IMB": SAALNS_NoImbalance,
         }
-        
-    def load_instance(self, filepath: str) -> Dict:
-        with open(filepath, 'r') as f:
-            return json.load(f)
-    
-    def create_vehicle(self, instance: Dict) -> Vehicle:
-        vehicle_data = instance['vehicle']
-        compartments = [Compartment(
-            id=comp['id'],
-            capacity=comp['capacity'],
-            position_x=comp['position_x'],
-            position_y=comp['position_y'],
-            load_density=1.0
-        ) for comp in vehicle_data['compartments']]
-        
-        compartment_positions = {comp['id']: comp['position_x'] for comp in vehicle_data['compartments']}
-        
-        return Vehicle(
-            id=0,
-            compartments=compartments,
-            max_payload=vehicle_data['max_payload'],
-            front_axle_max=vehicle_data['front_axle_max'],
-            rear_axle_max=vehicle_data['rear_axle_max'],
-            wheelbase=vehicle_data['wheelbase'],
-            unladen_weight=vehicle_data['unladen_weight'],
-            max_volume=sum(c.capacity for c in compartments),
-            steering_min_ratio=vehicle_data['steering_min_ratio'],
-            driving_min_ratio=vehicle_data['driving_min_ratio'],
-            product_densities=vehicle_data.get('product_densities', {}),
-            fixed_cost=100.0,
-            cost_per_km=1.0,
-            front_axle_min=vehicle_data.get('front_axle_min', vehicle_data['front_axle_max'] * 0.1),
-            rear_axle_min=vehicle_data.get('rear_axle_min', vehicle_data['rear_axle_max'] * 0.1),
-            cg_min=vehicle_data.get('cg_min', 0.3 * vehicle_data['wheelbase']),
-            cg_max=vehicle_data.get('cg_max', 0.7 * vehicle_data['wheelbase']),
-            compartment_positions=compartment_positions,
-            is_multi_compartment=True
-        )
-    
-    def build_instance_data(self, instance: Dict) -> Dict:
-        n = len(instance['customers'])
-        coords = [[0, 0]] + [[c['x'], c['y']] for c in instance['customers']]
-        dist_matrix = [[math.sqrt((coords[i][0] - coords[j][0])**2 + (coords[i][1] - coords[j][1])**2) 
-                       for j in range(n + 1)] for i in range(n + 1)]
-        
-        return {
-            'name': instance['name'],
-            'customers': instance['customers'],
-            'time_windows': instance['time_windows'],
-            'distance_matrix': dist_matrix,
-            'vehicle': instance['vehicle'],
-            'n_products': instance.get('n_products', 3),
-            'n_customers': len(instance['customers']),
-            'n_compartments': instance.get('n_compartments', len(instance['vehicle']['compartments']))
-        }
-    
-    def run_single_instance(self, instance_file: str, num_runs: int = 3) -> Dict:
-        instance = self.load_instance(instance_file)
-        vehicle = self.create_vehicle(instance)
-        instance_data = self.build_instance_data(instance)
-        
-        results = {
-            'instance': instance['name'],
-            'n_customers': len(instance['customers']),
-            'n_compartments': instance.get('n_compartments', len(instance['vehicle']['compartments'])),
-            'layer': instance.get('layer', 'Unknown'),
-            'n_products': instance.get('n_products', 3),
-            'results': {}
-        }
-        
-        print(f"\n  Testing on {instance['name']} ({len(instance['customers'])} customers, "
-              f"{instance.get('n_products', 3)} commodities, {results['n_compartments']} compartments)")
-        
-        for algo_name, algo_class in self.algorithms.items():
-            print(f"    Running {algo_name}...", end='', flush=True)
-            costs = []
-            times = []
-            metrics_list = []
-            
-            for run in range(num_runs):
-                try:
-                    random.seed(42 + run * 13)
-                    np.random.seed(42 + run * 13)
-                    algo = algo_class(instance_data, vehicle)
-                    start_time = time.time()
-                    solution, cost, extra = algo.solve()
-                    elapsed = time.time() - start_time
-                    
-                    if solution:
-                        if 'metrics' in extra and extra['metrics'] is not None:
-                            metrics = extra['metrics']
-                        else:
-                            calc = ObjectiveCalculator(instance_data, vehicle)
-                            metrics = calc.compute_all_metrics(solution)
-                        
-                        costs.append(cost)
-                        times.append(elapsed)
-                        metrics_list.append(metrics)
-                except Exception as e:
-                    print(f"\n      Error in run {run}: {e}")
-                    continue
-            
-            if costs:
-                avg_metrics = self._average_metrics(metrics_list)
-                results['results'][algo_name] = {
-                    # Economic Efficiency
-                    'avg_cost': np.mean(costs),
-                    'std_cost': np.std(costs),
-                    'best_cost': min(costs),
-                    'worst_cost': max(costs),
-                    'avg_total_distance': avg_metrics.total_distance,
-                    'avg_fleet_size': avg_metrics.fleet_size,
-                    'avg_fleet_utilization': avg_metrics.fleet_utilization,
-                    'avg_volume_utilization': avg_metrics.volume_utilization,
-                    
-                    # Safety Compliance
-                    'avg_ldd_violation_rate': avg_metrics.ldd_violation_rate,
-                    'avg_stability': avg_metrics.stability_margin,
-                    'avg_minimum_load_ratio': avg_metrics.minimum_load_ratio,
-                    'avg_slosh_risk': avg_metrics.slosh_risk_score,
-                    
-                    # Computational Performance
-                    'avg_time': np.mean(times),
-                    'std_time': np.std(times),
-                    'avg_cpu_time': avg_metrics.cpu_time,
-                    'avg_saca_calls': avg_metrics.saca_calls,
-                    'avg_cache_hit_rate': avg_metrics.cache_hit_rate,
-                    'avg_iterations_to_convergence': avg_metrics.iterations_to_convergence,
-                    
-                    # CG Metrics
-                    'avg_cg_position': avg_metrics.cg_position_mean,
-                    'avg_cg_compliance_rate': avg_metrics.cg_compliance_rate,
-                    'avg_cg_deviation': avg_metrics.cg_deviation_from_optimum,
-                    'avg_heeling_moment': avg_metrics.heeling_moment_estimate,
-                    'avg_lateral_margin': avg_metrics.lateral_acceleration_margin
-                }
-                print(f" done (avg cost: {np.mean(costs):.2f})", flush=True)
-            else:
-                print(" failed", flush=True)
-        
-        return results
-    
-    def _average_metrics(self, metrics_list: List[PerformanceMetrics]) -> PerformanceMetrics:
-        if not metrics_list:
-            return PerformanceMetrics(
-                total_distance=0,
-                transportation_cost=0,
-                fleet_size=0,
-                fleet_utilization=0,
-                volume_utilization=0,
-                ldd_violation_rate=0,
-                stability_margin=0,
-                minimum_load_ratio=0,
-                slosh_risk_score=0,
-                cpu_time=0,
-                saca_calls=0,
-                cache_hit_rate=0,
-                iterations_to_convergence=0
-            )
-        
-        avg = PerformanceMetrics(
-            total_distance=0,
-            transportation_cost=0,
-            fleet_size=0,
-            fleet_utilization=0,
-            volume_utilization=0,
-            ldd_violation_rate=0,
-            stability_margin=0,
-            minimum_load_ratio=0,
-            slosh_risk_score=0,
-            cpu_time=0,
-            saca_calls=0,
-            cache_hit_rate=0,
-            iterations_to_convergence=0
-        )
-        
-        for m in metrics_list:
-            avg.total_distance += m.total_distance
-            avg.transportation_cost += m.transportation_cost
-            avg.fleet_size += m.fleet_size
-            avg.fleet_utilization += m.fleet_utilization
-            avg.volume_utilization += m.volume_utilization
-            avg.ldd_violation_rate += m.ldd_violation_rate
-            avg.stability_margin += m.stability_margin
-            avg.minimum_load_ratio += m.minimum_load_ratio
-            avg.slosh_risk_score += m.slosh_risk_score
-            avg.cpu_time += m.cpu_time
-            avg.saca_calls += m.saca_calls
-            avg.cache_hit_rate += m.cache_hit_rate
-            avg.iterations_to_convergence += m.iterations_to_convergence
-            avg.cg_position_mean += m.cg_position_mean
-            avg.cg_position_std += m.cg_position_std
-            avg.cg_position_min += m.cg_position_min
-            avg.cg_position_max += m.cg_position_max
-            avg.cg_compliance_rate += m.cg_compliance_rate
-            avg.cg_deviation_from_optimum += m.cg_deviation_from_optimum
-            avg.heeling_moment_estimate += m.heeling_moment_estimate
-            avg.lateral_acceleration_margin += m.lateral_acceleration_margin
-        
-        n = len(metrics_list)
-        if n > 0:
-            for attr in ['total_distance', 'transportation_cost', 'fleet_size', 'fleet_utilization',
-                        'volume_utilization', 'ldd_violation_rate', 'stability_margin', 
-                        'minimum_load_ratio', 'slosh_risk_score', 'cpu_time', 'saca_calls',
-                        'cache_hit_rate', 'iterations_to_convergence', 'cg_position_mean',
-                        'cg_position_std', 'cg_position_min', 'cg_position_max',
-                        'cg_compliance_rate', 'cg_deviation_from_optimum', 
-                        'heeling_moment_estimate', 'lateral_acceleration_margin']:
-                if hasattr(avg, attr):
-                    setattr(avg, attr, getattr(avg, attr) / n)
-        
-        return avg
-    
-    def run_all_instances(self, max_instances: int = None) -> pd.DataFrame:
-        instance_files = []
-        for root, dirs, files in os.walk(self.benchmark_dir):
-            for file in files:
-                if file.endswith('.json'):
-                    instance_files.append(os.path.join(root, file))
-        
-        instance_files.sort(key=lambda x: os.path.basename(x))
-        
+
+    def run_all_instances(self, max_instances=None):
+        files = []
+        for root, _, fs in os.walk(self.benchmark_dir):
+            for f in fs:
+                if f.endswith(".json"):
+                    files.append(os.path.join(root, f))
+        files.sort(key=lambda p: (
+            len(json.load(open(p))["customers"]), os.path.basename(p)))
         if max_instances:
-            instance_files = instance_files[:max_instances]
-        
-        print(f"\nPART 2: ABLATION STUDY (6 Variants)")
-        print(f"Found {len(instance_files)} instance files")
-        print(f"Ablation Variants:")
-        print("  1. IALNS (Full)")
-        print("  2. IALNS_NS (No Stability verification)")
-        print("  3. IALNS_NA (No Adaptive operator selection)")
-        print("  4. IALNS_SEQ (Sequential optimization)")
-        print("  5. IALNS_NC (No Cache)")
-        print("  6. IALNS_IMB (No Imbalance destroy operator)")
-        print("-" * 60)
-        
+            files = files[:max_instances]
+        print(f"\nABLATION STUDY: {len(files)} instances")
         all_results = []
-        for i, filepath in enumerate(instance_files):
-            print(f"\nProcessing {i+1}/{len(instance_files)}: {os.path.basename(filepath)}")
+        for i, fp in enumerate(files):
+            print(f"\n[{i+1}/{len(files)}] {os.path.basename(fp)}")
             try:
-                result = self.run_single_instance(filepath, num_runs=3)
-                all_results.append(result)
+                all_results.append(self.run_one(fp))
             except Exception as e:
-                print(f"  Error: {e}")
-                continue
-        
-        df = self._results_to_dataframe(all_results)
+                print(f"  Skipped: {e}")
+        df = self._to_df(all_results)
         if not df.empty:
-            csv_path = os.path.join(self.output_dir, 'ablation_study_results.csv')
-            df.to_csv(csv_path, index=False)
-            print(f"\nAblation results saved to: {csv_path}")
+            df.to_csv(os.path.join(self.output_dir, "ablation_study_results.csv"),
+                      index=False)
         return df
-    
-    def _results_to_dataframe(self, results: List[Dict]) -> pd.DataFrame:
-        rows = []
-        for result in results:
-            if not result['results']:
-                continue
-            base_row = {
-                'instance': result['instance'],
-                'n_customers': result['n_customers'],
-                'n_compartments': result.get('n_compartments', 0),
-                'layer': result.get('layer', 'Unknown'),
-                'n_products': result.get('n_products', 3)
-            }
-            for algo, data in result['results'].items():
-                row = base_row.copy()
-                row['algorithm'] = algo
-                for key, value in data.items():
-                    row[key] = value
-                rows.append(row)
-        return pd.DataFrame(rows)
 
 
 # ============================================================================
 # MULTI-COMPARTMENT COMPARISON
 # ============================================================================
 
-def run_multicomp_comparison(sota_df: pd.DataFrame, benchmark_dir: str, output_dir: str) -> pd.DataFrame:
+def _metrics_infeasible(m):
+    if m is None:
+        return True
+    return not np.isfinite(m.penalised_cost)
+
+
+def run_multicomp_comparison(sota_df, benchmark_dir, output_dir):
     print("\n" + "=" * 80)
-    print("MULTI-COMPARTMENT vs SINGLE-COMPARTMENT COMPARISON")
+    print("MULTI vs SINGLE PRODUCT (Option B1)")
     print("=" * 80)
-    
-    # Check if DataFrame is empty or missing required columns
-    if sota_df.empty:
-        print("SOTA DataFrame is empty. Skipping multi-compartment comparison.")
+    out_csv = os.path.join(output_dir, "part4_statistics",
+                           "multicomp_benefits.csv")
+    os.makedirs(os.path.dirname(out_csv), exist_ok=True)
+
+    if sota_df is None or sota_df.empty or "algorithm" not in sota_df.columns:
+        print("  sota_df empty or malformed; writing empty CSV.")
+        pd.DataFrame().to_csv(out_csv, index=False)
         return pd.DataFrame()
-    
-    if 'algorithm' not in sota_df.columns:
-        print("'algorithm' column not found in SOTA DataFrame. Skipping multi-compartment comparison.")
+
+    sa_rows = sota_df[sota_df["algorithm"] == "SA-ALNS"]
+    if sa_rows.empty:
+        print("  No 'SA-ALNS' rows; writing empty CSV.")
+        pd.DataFrame().to_csv(out_csv, index=False)
         return pd.DataFrame()
-    
-    ialns_df = sota_df[sota_df['algorithm'] == 'IALNS']
-    
-    if ialns_df.empty:
-        print("No IALNS data found for comparison")
-        return pd.DataFrame()
-    
-    results = []
-    compartment_stats = defaultdict(lambda: {'count': 0, 'cost_imp': [], 'fleet_red': [], 'util_imp': []})
-    
-    for idx, row in ialns_df.iterrows():
-        instance_name = row['instance']
-        n_customers = row['n_customers']
-        layer = row.get('layer', 'Unknown')
-        n_compartments = row.get('n_compartments', 3)
-        
-        instance_file = None
-        for root, dirs, files in os.walk(benchmark_dir):
-            if f"{instance_name}.json" in files:
-                instance_file = os.path.join(root, f"{instance_name}.json")
+
+    print(f"  Instances: {len(sa_rows)}")
+    rows, errors = [], 0
+    for _, r in sa_rows.iterrows():
+        name = r["instance"]
+        fp = None
+        for root, _, fs in os.walk(benchmark_dir):
+            if f"{name}.json" in fs:
+                fp = os.path.join(root, f"{name}.json")
                 break
-        
-        if instance_file is None:
+        if fp is None:
             continue
-        
         try:
-            with open(instance_file, 'r') as f:
-                instance = json.load(f)
-            
-            actual_n_compartments = instance.get('n_compartments', len(instance['vehicle']['compartments']))
-            
-            vehicle = create_single_compartment_vehicle(instance)
-            instance_data = build_instance_data(instance)
-            
-            random.seed(42)
-            np.random.seed(42)
-            algo = IALNSAlgorithm(instance_data, vehicle)
-            solution, cost, extra = algo.solve()
-            metrics = extra['metrics'] if 'metrics' in extra else None
-            
-            if metrics is None:
-                calc = ObjectiveCalculator(instance_data, vehicle)
-                metrics = calc.compute_all_metrics(solution)
-            
-            cost_improvement = (metrics.transportation_cost - row['avg_cost']) / metrics.transportation_cost * 100 if metrics.transportation_cost > 0 else 0
-            fleet_reduction = (metrics.fleet_size - row.get('avg_fleet_size', 0)) / max(1, metrics.fleet_size) * 100
-            util_improvement = (row['avg_volume_utilization'] - metrics.volume_utilization) / max(1, row['avg_volume_utilization']) * 100
-            
-            results.append({
-                'instance': instance_name,
-                'n_customers': n_customers,
-                'layer': layer,
-                'n_compartments': actual_n_compartments,
-                'n_products': instance.get('n_products', 3),
-                'multi_cost': row['avg_cost'],
-                'single_cost': metrics.transportation_cost,
-                'cost_improvement': cost_improvement,
-                'multi_fleet': row.get('avg_fleet_size', 0),
-                'single_fleet': metrics.fleet_size,
-                'fleet_reduction': fleet_reduction,
-                'multi_util': row['avg_volume_utilization'],
-                'single_util': metrics.volume_utilization,
-                'util_improvement': util_improvement,
-                'multi_violation': row.get('avg_ldd_violation_rate', 0),
-                'single_violation': metrics.ldd_violation_rate,
-                'multi_cg_compliance': row.get('avg_cg_compliance_rate', 100),
-                'single_cg_compliance': metrics.cg_compliance_rate
+            inst = json.load(open(fp))
+            n_cmp = inst.get("n_compartments",
+                             len(inst["vehicle"]["compartments"]))
+            data = build_instance_data(inst)
+            seed = _stable_seed("multicomp", name)
+
+            veh_A = create_vehicle_from_instance(inst, multi_compartment=True)
+            random.seed(seed); np.random.seed(seed)
+            algo_A = SAALNSAlgorithm(data, veh_A)
+            sol_A, _, extra_A = algo_A.solve()
+            m_A = extra_A.get("metrics") or \
+                algo_A.calc.compute_all_metrics(
+                    sol_A, lambda_W=algo_A.lambda_W, lambda_S=algo_A.lambda_S)
+
+            veh_B = create_vehicle_from_instance(inst, multi_compartment=True)
+            random.seed(seed); np.random.seed(seed)
+            algo_B = SAALNS_SingleProduct(data, veh_B)
+            sol_B, _, extra_B = algo_B.solve()
+            m_B = extra_B.get("metrics") or \
+                algo_B.calc.compute_all_metrics(
+                    sol_B, lambda_W=algo_B.lambda_W, lambda_S=algo_B.lambda_S)
+
+            veh_C = create_vehicle_from_instance(inst, multi_compartment=False)
+            random.seed(seed); np.random.seed(seed)
+            algo_C = SAALNSAlgorithm(data, veh_C)
+            sol_C, _, extra_C = algo_C.solve()
+            m_C = extra_C.get("metrics") or \
+                algo_C.calc.compute_all_metrics(
+                    sol_C, lambda_W=algo_C.lambda_W, lambda_S=algo_C.lambda_S)
+
+            def pct(base, other):
+                if not np.isfinite(base) or not np.isfinite(other):
+                    return float("nan")
+                if abs(other) < 1e-9:
+                    return float("nan")
+                return (other - base) / other * 100.0
+
+            rows.append({
+                "instance": name,
+                "n_customers": r["n_customers"],
+                "layer": r.get("layer", "Unknown"),
+                "n_compartments": n_cmp,
+                "A_full_cost": m_A.penalised_cost,
+                "A_full_fleet": m_A.fleet_size,
+                "A_full_util": m_A.volume_utilization,
+                "A_full_cg": m_A.cg_compliance_rate,
+                "A_full_ldd": m_A.ldd_violation_rate,
+                "A_full_slosh": m_A.slosh_risk_score,
+                "A_full_feasible": not _metrics_infeasible(m_A),
+                "B_nomix_cost": m_B.penalised_cost,
+                "B_nomix_fleet": m_B.fleet_size,
+                "B_nomix_util": m_B.volume_utilization,
+                "B_nomix_cg": m_B.cg_compliance_rate,
+                "B_nomix_ldd": m_B.ldd_violation_rate,
+                "B_nomix_slosh": m_B.slosh_risk_score,
+                "B_nomix_feasible": not _metrics_infeasible(m_B),
+                "C_forced_cost": m_C.penalised_cost,
+                "C_forced_fleet": m_C.fleet_size,
+                "C_forced_feasible": not _metrics_infeasible(m_C),
+                "cost_improvement_AB": pct(m_A.penalised_cost, m_B.penalised_cost),
+                "fleet_reduction_AB": pct(m_A.fleet_size, m_B.fleet_size),
+                "util_improvement_AB": pct(m_A.volume_utilization,
+                                           m_B.volume_utilization),
+                "cost_improvement_AC": pct(m_A.penalised_cost, m_C.penalised_cost),
+                "fleet_reduction_AC": pct(m_A.fleet_size, m_C.fleet_size),
             })
-            
-            compartment_stats[actual_n_compartments]['count'] += 1
-            compartment_stats[actual_n_compartments]['cost_imp'].append(cost_improvement)
-            compartment_stats[actual_n_compartments]['fleet_red'].append(fleet_reduction)
-            compartment_stats[actual_n_compartments]['util_imp'].append(util_improvement)
-            
-            print(f"  Processed {instance_name}: {actual_n_compartments} compartments, Cost improvement {cost_improvement:.1f}%")
+            print(f"    {name}: A={m_A.penalised_cost:.1f} "
+                  f"B={m_B.penalised_cost:.1f} "
+                  f"C={'inf' if not np.isfinite(m_C.penalised_cost) else f'{m_C.penalised_cost:.1f}'}")
         except Exception as e:
-            print(f"  Error processing {instance_name}: {e}")
-            continue
-    
-    df = pd.DataFrame(results)
-    
+            errors += 1
+            print(f"  Error on {name}: {type(e).__name__}: {e}")
+
+    df = pd.DataFrame(rows)
+    print(f"\n  Rows: {len(df)}, errors: {errors}")
+
     if not df.empty:
-        csv_path = os.path.join(output_dir, 'part4_statistics', 'multicomp_benefits.csv')
-        df.to_csv(csv_path, index=False)
-        print(f"\nMulti-compartment comparison results saved to: {csv_path}")
-        
-        print("\n" + "=" * 60)
-        print("COMPARTMENT-LEVEL ANALYSIS")
-        print("=" * 60)
-        
-        for n_comp, stats in sorted(compartment_stats.items()):
-            if stats['count'] > 0:
-                print(f"\n{n_comp} Compartments ({stats['count']} instances):")
-                print(f"  Avg Cost Improvement: {np.mean(stats['cost_imp']):.1f}% (±{np.std(stats['cost_imp']):.1f})")
-                print(f"  Avg Fleet Reduction: {np.mean(stats['fleet_red']):.1f}% (±{np.std(stats['fleet_red']):.1f})")
-                print(f"  Avg Utilization Improvement: {np.mean(stats['util_imp']):.1f}% (±{np.std(stats['util_imp']):.1f})")
-        
-        comp_summary = []
-        for n_comp, stats in sorted(compartment_stats.items()):
-            if stats['count'] > 0:
-                comp_summary.append({
-                    'n_compartments': n_comp,
-                    'count': stats['count'],
-                    'avg_cost_improvement': np.mean(stats['cost_imp']),
-                    'std_cost_improvement': np.std(stats['cost_imp']),
-                    'avg_fleet_reduction': np.mean(stats['fleet_red']),
-                    'std_fleet_reduction': np.std(stats['fleet_red']),
-                    'avg_util_improvement': np.mean(stats['util_imp']),
-                    'std_util_improvement': np.std(stats['util_imp'])
-                })
-        
-        comp_df = pd.DataFrame(comp_summary)
-        if not comp_df.empty:
-            comp_csv_path = os.path.join(output_dir, 'part4_statistics', 'multicomp_benefits_by_compartments.csv')
-            comp_df.to_csv(comp_csv_path, index=False)
-            print(f"\nCompartment-level summary saved to: {comp_csv_path}")
-    
+        n_inf_B = int((~np.isfinite(df["B_nomix_cost"])).sum())
+        n_inf_C = int((~np.isfinite(df["C_forced_cost"])).sum())
+        if n_inf_B > 0.2 * len(df):
+            print("\n" + "!" * 80)
+            print(f"  [WARNING] B_nomix_cost is inf on {n_inf_B}/{len(df)} "
+                  f"instances ({100.0*n_inf_B/len(df):.1f}%).")
+            print("!" * 80)
+        if n_inf_C > 0:
+            print(f"  [info] C_forced_cost is inf on {n_inf_C}/{len(df)} "
+                  f"instances ({100.0*n_inf_C/len(df):.1f}%).")
+
+        finite_B = df[np.isfinite(df["B_nomix_cost"])]
+        if not finite_B.empty:
+            print(f"\n  ---- A vs B (on the {len(finite_B)} finite-B instances) ----")
+            print(f"  Mean cost improvement  : {_finite_mean(finite_B['cost_improvement_AB']):+.2f}%")
+            print(f"  Mean fleet reduction   : {_finite_mean(finite_B['fleet_reduction_AB']):+.2f}%")
+            print(f"  Mean util improvement  : {_finite_mean(finite_B['util_improvement_AB']):+.2f}%")
+            if len(finite_B) > 0:
+                wins_A = int((finite_B['cost_improvement_AB'] > 0).sum())
+                wins_B = int((finite_B['cost_improvement_AB'] < 0).sum())
+                print(f"  A beats B on cost      : {wins_A}/{len(finite_B)}")
+                print(f"  B beats A on cost      : {wins_B}/{len(finite_B)}")
+        print(f"  A feasible: {df['A_full_feasible'].sum()}/{len(df)}")
+        print(f"  B feasible: {df['B_nomix_feasible'].sum()}/{len(df)}")
+        print(f"  C feasible: {df['C_forced_feasible'].sum()}/{len(df)}")
+
+    df.to_csv(out_csv, index=False)
+    print(f"  Wrote {out_csv}")
     return df
-
-def build_instance_data(instance: Dict) -> Dict:
-    n = len(instance['customers'])
-    coords = [[0, 0]] + [[c['x'], c['y']] for c in instance['customers']]
-    dist_matrix = [[math.sqrt((coords[i][0] - coords[j][0])**2 + (coords[i][1] - coords[j][1])**2) 
-                   for j in range(n + 1)] for i in range(n + 1)]
-    
-    return {
-        'name': instance['name'],
-        'customers': instance['customers'],
-        'time_windows': instance['time_windows'],
-        'distance_matrix': dist_matrix,
-        'vehicle': instance['vehicle'],
-        'n_products': instance.get('n_products', 3),
-        'n_customers': len(instance['customers']),
-        'n_compartments': instance.get('n_compartments', len(instance['vehicle']['compartments']))
-    }
-
-
-# ============================================================================
-# FIGURE GENERATION FUNCTIONS
-# ============================================================================
-
-def generate_all_figures(sota_df: pd.DataFrame, ablation_df: pd.DataFrame, 
-                        multicomp_df: pd.DataFrame, output_dir: str):
-    print("\n" + "=" * 80)
-    print("GENERATING FIGURES")
-    print("=" * 80)
-    
-    # SOTA Figures
-    if not sota_df.empty:
-        fig1_sota_cost(sota_df, output_dir)
-        fig2_sota_stability(sota_df, output_dir)
-        fig3_sota_radar(sota_df, output_dir)
-        fig4_sota_scalability(sota_df, output_dir)
-    else:
-        print("  Skipping SOTA figures: No SOTA data")
-    
-    # Ablation Figures
-    if not ablation_df.empty:
-        fig5_ablation_cost(ablation_df, output_dir)
-        fig6_ablation_stability(ablation_df, output_dir)
-        fig7_ablation_bar(ablation_df, output_dir)
-    else:
-        print("  Skipping Ablation figures: No ablation data")
-    
-    # Statistics Figures
-    if not sota_df.empty:
-        fig8_convergence_analysis(sota_df, output_dir)
-        fig9_correlation(sota_df, output_dir)
-        fig10_layer_analysis(sota_df, ablation_df, output_dir)
-        fig11_statistical_significance(sota_df, output_dir)
-        fig12_cg_validation(sota_df, output_dir)
-        fig13_cg_compliance(sota_df, output_dir)
-    else:
-        print("  Skipping Statistics figures: No SOTA data")
-    
-    # Multi-compartment comparison figure
-    if not multicomp_df.empty:
-        fig14_multicomp_comparison(multicomp_df, output_dir)
-        fig15_compartment_analysis(multicomp_df, output_dir)
-    else:
-        print("  Skipping Multi-compartment figures: No comparison data")
-    
-    print("\nAll figures generated successfully!")
-
-
-def fig1_sota_cost(df: pd.DataFrame, output_dir: str):
-    fig, ax = plt.subplots(figsize=(12, 6))
-    algo_order = ['IALNS', 'Standard_ALNS', 'FDAHS', 'GCOF', 'HSA', 'ACO_2opt']
-    
-    for algo in algo_order:
-        algo_df = df[df['algorithm'] == algo]
-        if algo_df.empty:
-            continue
-        grouped = algo_df.groupby('n_customers')['avg_cost'].agg(['mean', 'std']).reset_index()
-        linewidth = 3 if algo == 'IALNS' else 2
-        markersize = 10 if algo == 'IALNS' else 7
-        ax.errorbar(grouped['n_customers'], grouped['mean'], yerr=grouped['std'],
-                   marker=MARKERS.get(algo, 'o'), color=COLORS_SOTA.get(algo, '#333333'),
-                   label=SOTA_DISPLAY_NAMES.get(algo, algo), markersize=markersize,
-                   capsize=4, elinewidth=1.5, linewidth=linewidth)
-    
-    ax.set_xlabel('Number of Customers', fontsize=12)
-    ax.set_ylabel('Average Transportation Cost ($)', fontsize=12)
-    ax.set_title('SOTA Comparison: Cost vs Instance Size', fontsize=14)
-    ax.legend(loc='upper left', frameon=True, fancybox=False, framealpha=0.9, fontsize=8)
-    ax.grid(True, alpha=0.3, linestyle='--')
-    plt.tight_layout()
-    plt.savefig(os.path.join(output_dir, 'part1_sota', 'Figure_1_SOTA_Cost_Comparison.pdf'), dpi=300)
-    plt.close()
-    print("  Generated: Figure_1_SOTA_Cost_Comparison")
-
-
-def fig2_sota_stability(df: pd.DataFrame, output_dir: str):
-    fig, ax = plt.subplots(figsize=(12, 6))
-    algo_order = ['IALNS', 'Standard_ALNS', 'FDAHS', 'GCOF', 'HSA', 'ACO_2opt']
-    
-    for algo in algo_order:
-        algo_df = df[df['algorithm'] == algo]
-        if algo_df.empty:
-            continue
-        grouped = algo_df.groupby('n_customers')['avg_stability'].agg(['mean', 'std']).reset_index()
-        linewidth = 3 if algo == 'IALNS' else 2
-        markersize = 10 if algo == 'IALNS' else 7
-        ax.errorbar(grouped['n_customers'], grouped['mean'], yerr=grouped['std'],
-                   marker=MARKERS.get(algo, 'o'), color=COLORS_SOTA.get(algo, '#333333'),
-                   label=SOTA_DISPLAY_NAMES.get(algo, algo), markersize=markersize,
-                   capsize=4, elinewidth=1.5, linewidth=linewidth)
-    
-    ax.set_xlabel('Number of Customers', fontsize=12)
-    ax.set_ylabel('Stability Margin (%)', fontsize=12)
-    ax.set_title('SOTA Comparison: Stability vs Instance Size', fontsize=14)
-    ax.legend(loc='upper right', frameon=True, fancybox=False, framealpha=0.9, fontsize=8)
-    ax.grid(True, alpha=0.3, linestyle='--')
-    ax.axhline(y=5.0, color='red', linestyle='--', linewidth=1, label='Safety Threshold')
-    plt.tight_layout()
-    plt.savefig(os.path.join(output_dir, 'part1_sota', 'Figure_2_SOTA_Stability_Comparison.pdf'), dpi=300)
-    plt.close()
-    print("  Generated: Figure_2_SOTA_Stability_Comparison")
-
-
-def fig3_sota_radar(df: pd.DataFrame, output_dir: str):
-    from math import pi
-    algo_order = ['IALNS', 'Standard_ALNS', 'FDAHS', 'GCOF', 'HSA', 'ACO_2opt']
-    metrics = ['avg_cost', 'avg_ldd_violation_rate', 'avg_stability', 'avg_volume_utilization', 'avg_cg_compliance_rate']
-    metric_labels = ['Cost (↓)', 'LDD Violation (↓)', 'Stability (↑)', 'Utilization (↑)', 'CG Compliance (↑)']
-    
-    algo_data = {}
-    for algo in algo_order:
-        algo_df = df[df['algorithm'] == algo]
-        if algo_df.empty:
-            continue
-        avg_metrics = {}
-        for m in metrics:
-            if m in algo_df.columns:
-                avg_metrics[m] = algo_df[m].mean()
-            else:
-                avg_metrics[m] = 0
-        algo_data[algo] = avg_metrics
-    
-    if not algo_data:
-        return
-    
-    all_values = {m: [algo_data[a][m] for a in algo_data if m in algo_data[a]] for m in metrics}
-    for m in metrics:
-        min_val = min(all_values[m]) if all_values[m] else 1
-        max_val = max(all_values[m]) if all_values[m] else 1
-        range_val = max_val - min_val or 1
-        for a in algo_data:
-            if m == 'avg_cost' or m == 'avg_ldd_violation_rate':
-                algo_data[a][m] = 1 - (algo_data[a][m] - min_val) / range_val
-            else:
-                algo_data[a][m] = (algo_data[a][m] - min_val) / range_val
-    
-    n_metrics = len(metrics)
-    angles = [n / float(n_metrics) * 2 * pi for n in range(n_metrics)]
-    angles += angles[:1]
-    
-    fig, ax = plt.subplots(figsize=(10, 10), subplot_kw=dict(polar=True))
-    for algo in algo_order:
-        if algo not in algo_data:
-            continue
-        values = [algo_data[algo][m] for m in metrics]
-        values += values[:1]
-        ax.plot(angles, values, linewidth=2, linestyle='-',
-                color=COLORS_SOTA.get(algo, '#333333'), label=SOTA_DISPLAY_NAMES.get(algo, algo))
-        ax.fill(angles, values, alpha=0.1, color=COLORS_SOTA.get(algo, '#333333'))
-    
-    ax.set_xticks(angles[:-1])
-    ax.set_xticklabels(metric_labels, fontsize=10)
-    ax.set_ylim(0, 1)
-    ax.set_yticks([0.2, 0.4, 0.6, 0.8, 1.0])
-    ax.set_yticklabels(['0.2', '0.4', '0.6', '0.8', '1.0'], fontsize=8)
-    ax.legend(loc='upper right', bbox_to_anchor=(1.3, 1.0), frameon=True, fancybox=False, fontsize=8)
-    ax.set_title('SOTA Performance Radar Chart', fontsize=14, pad=20)
-    plt.tight_layout()
-    plt.savefig(os.path.join(output_dir, 'part1_sota', 'Figure_3_SOTA_Radar.pdf'), dpi=300)
-    plt.close()
-    print("  Generated: Figure_3_SOTA_Radar")
-
-
-def fig4_sota_scalability(df: pd.DataFrame, output_dir: str):
-    fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(14, 6))
-    algo_order = ['IALNS', 'Standard_ALNS', 'FDAHS', 'GCOF', 'HSA', 'ACO_2opt']
-    
-    for algo in algo_order:
-        algo_df = df[df['algorithm'] == algo]
-        if algo_df.empty:
-            continue
-        grouped = algo_df.groupby('n_customers')['avg_time'].agg(['mean', 'std']).reset_index()
-        ax1.errorbar(grouped['n_customers'], grouped['mean'], yerr=grouped['std'],
-                   marker=MARKERS.get(algo, 'o'), color=COLORS_SOTA.get(algo, '#333333'),
-                   label=SOTA_DISPLAY_NAMES.get(algo, algo), markersize=6,
-                   capsize=3, elinewidth=1, linewidth=1.5)
-    
-    ax1.set_xlabel('Number of Customers', fontsize=12)
-    ax1.set_ylabel('CPU Time (seconds)', fontsize=12)
-    ax1.set_title('Runtime Scaling', fontsize=12)
-    ax1.legend(loc='upper left', frameon=True, fancybox=False, framealpha=0.9, fontsize=7)
-    ax1.grid(True, alpha=0.3, linestyle='--')
-    ax1.set_yscale('log')
-    
-    data_to_plot = []
-    labels = []
-    for algo in algo_order:
-        algo_df = df[df['algorithm'] == algo]
-        if algo_df.empty:
-            continue
-        data_to_plot.append(algo_df['avg_cost'].values)
-        labels.append(SOTA_DISPLAY_NAMES.get(algo, algo))
-    
-    if data_to_plot:
-        bp = ax2.boxplot(data_to_plot, labels=labels, patch_artist=True)
-        for patch, color in zip(bp['boxes'], [COLORS_SOTA.get(a, '#333333') for a in algo_order if a in df['algorithm'].unique()]):
-            patch.set_facecolor(color)
-            patch.set_alpha(0.7)
-        ax2.set_xlabel('Algorithm', fontsize=12)
-        ax2.set_ylabel('Transportation Cost ($)', fontsize=12)
-        ax2.set_title('Cost Distribution by Algorithm', fontsize=12)
-        ax2.grid(True, alpha=0.3, linestyle='--', axis='y')
-        ax2.tick_params(axis='x', rotation=45)
-    
-    plt.tight_layout()
-    plt.savefig(os.path.join(output_dir, 'part1_sota', 'Figure_4_SOTA_Scalability.pdf'), dpi=300)
-    plt.close()
-    print("  Generated: Figure_4_SOTA_Scalability")
-
-
-# [The remaining figure functions fig5-fig15 are included in the full script]
-# Due to length constraints, they are available in the previous complete version.
 
 
 # ============================================================================
 # STATISTICAL TESTS
 # ============================================================================
 
-def run_statistical_tests(sota_df: pd.DataFrame, output_dir: str):
+def _wilcoxon_safe(a, b):
+    a = np.asarray(a, dtype=float)
+    b = np.asarray(b, dtype=float)
+    mask = np.isfinite(a) & np.isfinite(b)
+    a, b = a[mask], b[mask]
+    if len(a) < 5:
+        return float("nan")
+    try:
+        _, p = wilcoxon(a, b)
+        return float(p)
+    except Exception:
+        return float("nan")
+
+
+def _mannwhitney_safe(a, b):
+    a = np.asarray(a, dtype=float)
+    b = np.asarray(b, dtype=float)
+    a = a[np.isfinite(a)]
+    b = b[np.isfinite(b)]
+    if len(a) < 2 or len(b) < 2:
+        return float("nan")
+    try:
+        _, p = mannwhitneyu(a, b)
+        return float(p)
+    except Exception:
+        return float("nan")
+
+
+def run_statistical_tests(sota_df, output_dir):
     print("\n" + "=" * 80)
-    print("RUNNING STATISTICAL TESTS")
+    print("STATISTICAL TESTS (SOTA, inf-filtered)")
     print("=" * 80)
-    
-    results = []
-    ialns_df = sota_df[sota_df['algorithm'] == 'IALNS']
-    if ialns_df.empty:
-        print("No IALNS data found")
-        return
-    
-    ialns_costs = ialns_df['avg_cost'].values
-    ialns_cg_compliance = ialns_df['avg_cg_compliance_rate'].values if 'avg_cg_compliance_rate' in ialns_df.columns else None
-    
-    for algo in ['Standard_ALNS', 'FDAHS', 'GCOF', 'HSA', 'ACO_2opt']:
-        algo_df = sota_df[sota_df['algorithm'] == algo]
-        if algo_df.empty:
+    if sota_df is None or sota_df.empty:
+        return None
+    sa = sota_df[sota_df["algorithm"] == "SA-ALNS"]
+    if sa.empty:
+        return None
+    rows = []
+    scost = sa["avg_cost"].replace([np.inf, -np.inf], np.nan).dropna().values
+    if len(scost) < 5:
+        print("  Insufficient finite SA-ALNS costs for statistics.")
+        return None
+    for algo in ["SA-ALNS_CostOnly", "Standard_ALNS", "FDAHS",
+                 "GCOF", "HSA", "ACO_2opt"]:
+        sub = sota_df[sota_df["algorithm"] == algo]
+        if sub.empty:
             continue
-        
-        algo_costs = algo_df['avg_cost'].values
-        algo_cg_compliance = algo_df['avg_cg_compliance_rate'].values if 'avg_cg_compliance_rate' in algo_df.columns else None
-        
-        if len(ialns_costs) > 0 and len(algo_costs) > 0:
-            try:
-                _, wilcoxon_p = wilcoxon(ialns_costs, algo_costs)
-            except:
-                wilcoxon_p = 1.0
-            try:
-                _, mannwhitney_p = mannwhitneyu(ialns_costs, algo_costs)
-            except:
-                mannwhitney_p = 1.0
-            
-            mean1, mean2 = np.mean(ialns_costs), np.mean(algo_costs)
-            std1, std2 = np.std(ialns_costs, ddof=1), np.std(algo_costs, ddof=1)
-            pooled_std = np.sqrt(((len(ialns_costs) - 1) * std1**2 + (len(algo_costs) - 1) * std2**2) / 
-                                (len(ialns_costs) + len(algo_costs) - 2))
-            cohens_d = (mean1 - mean2) / pooled_std if pooled_std > 0 else 0
-            improvement = (mean2 - mean1) / mean2 * 100 if mean2 > 0 else 0
-            
-            cg_improvement = 0
-            if ialns_cg_compliance is not None and algo_cg_compliance is not None:
-                cg_improvement = np.mean(ialns_cg_compliance) - np.mean(algo_cg_compliance)
-            
-            results.append({
-                'Algorithm': SOTA_DISPLAY_NAMES.get(algo, algo),
-                'IALNS Mean': mean1,
-                'Competitor Mean': mean2,
-                'Improvement (%)': improvement,
-                'CG Compliance Improvement (%)': cg_improvement,
-                'Wilcoxon p-value': wilcoxon_p,
-                'Mann-Whitney p-value': mannwhitney_p,
-                'Cohen_d': cohens_d,
-                'Significant (p < 0.05)': mannwhitney_p < 0.05
-            })
-    
-    results_df = pd.DataFrame(results)
-    csv_path = os.path.join(output_dir, 'part4_statistics', 'statistical_tests_results.csv')
-    results_df.to_csv(csv_path, index=False)
-    print(f"Statistical tests results saved to: {csv_path}")
-    
-    print("\nStatistical Test Results:")
-    print("-" * 60)
-    for _, row in results_df.iterrows():
-        print(f"\n{row['Algorithm']}:")
-        print(f"  Cost Improvement vs IALNS: {row['Improvement (%)']:.1f}%")
-        print(f"  CG Compliance Improvement: {row['CG Compliance Improvement (%)']:.1f}%")
-        print(f"  Wilcoxon p-value: {row['Wilcoxon p-value']:.4f}")
-        print(f"  Mann-Whitney p-value: {row['Mann-Whitney p-value']:.4f}")
-        print(f"  Cohen's d: {row['Cohen_d']:.3f}")
-        print(f"  Statistically significant: {row['Significant (p < 0.05)']}")
-    
-    return results_df
+        c = sub["avg_cost"].replace([np.inf, -np.inf], np.nan).dropna().values
+        if len(c) < 5:
+            print(f"  {algo}: insufficient finite costs ({len(c)}); skipped.")
+            continue
+        wp = _wilcoxon_safe(scost, c)
+        mp = _mannwhitney_safe(scost, c)
+        m1, m2 = float(np.mean(scost)), float(np.mean(c))
+        s1 = float(np.std(scost, ddof=1)) if len(scost) > 1 else 0.0
+        s2 = float(np.std(c, ddof=1)) if len(c) > 1 else 0.0
+        pooled = math.sqrt(((len(scost) - 1) * s1 ** 2 + (len(c) - 1) * s2 ** 2) /
+                           max(len(scost) + len(c) - 2, 1))
+        d = (m1 - m2) / pooled if pooled > 0 else 0
+        imp = (m2 - m1) / m2 * 100 if m2 > 0 else 0
+        rows.append({"Algorithm": SOTA_DISPLAY_NAMES.get(algo, algo),
+                     "SAALNS_n_finite": len(scost),
+                     "Comp_n_finite": len(c),
+                     "SAALNS_mean": m1, "Comp_mean": m2,
+                     "Improvement_pct": imp, "Wilcoxon_p": wp,
+                     "MannWhitney_p": mp, "Cohen_d": d,
+                     "Significant_5pct": bool(np.isfinite(mp) and mp < 0.05)})
+    if not rows:
+        return None
+    df = pd.DataFrame(rows)
+    df.to_csv(os.path.join(output_dir, "part4_statistics",
+                           "statistical_tests_results.csv"), index=False)
+    print(df.to_string(index=False))
+    return df
 
 
-# ============================================================================
-# SUMMARY STATISTICS
-# ============================================================================
-
-def generate_summary_statistics(sota_df: pd.DataFrame, ablation_df: pd.DataFrame, 
-                               multicomp_df: pd.DataFrame, output_dir: str):
+def paired_ablation_tests(output_dir):
     print("\n" + "=" * 80)
-    print("GENERATING SUMMARY STATISTICS")
+    print("PAIRED ABLATION WILCOXON TESTS (inf-filtered)")
     print("=" * 80)
-    
-    summary_dir = os.path.join(output_dir, 'part4_statistics')
-    os.makedirs(summary_dir, exist_ok=True)
-    
-    if not sota_df.empty:
-        sota_metrics = ['avg_cost', 'avg_ldd_violation_rate', 'avg_stability', 'avg_time',
-                       'avg_fleet_utilization', 'avg_volume_utilization', 'avg_minimum_load_ratio',
-                       'avg_slosh_risk', 'avg_cg_compliance_rate']
-        sota_summary = sota_df.groupby('algorithm')[sota_metrics].agg(['mean', 'std']).round(2)
-        sota_summary.to_csv(os.path.join(summary_dir, 'sota_summary.csv'))
-        print("  Generated: sota_summary.csv")
-        
-        if 'avg_cg_position' in sota_df.columns:
-            cg_summary = sota_df.groupby('algorithm')[['avg_cg_position', 'avg_cg_compliance_rate', 'avg_cg_deviation']].mean().round(2)
-            cg_summary.to_csv(os.path.join(summary_dir, 'cg_summary.csv'))
-            print("  Generated: cg_summary.csv")
-        
-        if 'layer' in sota_df.columns:
-            layer_summary = sota_df.groupby(['algorithm', 'layer']).agg({
-                'avg_cost': 'mean', 'avg_ldd_violation_rate': 'mean',
-                'avg_stability': 'mean', 'avg_cg_compliance_rate': 'mean'
-            }).round(2)
-            layer_summary.to_csv(os.path.join(summary_dir, 'sota_layer_summary.csv'))
-            print("  Generated: sota_layer_summary.csv")
-    
-    if not ablation_df.empty:
-        ablation_metrics = ['avg_cost', 'avg_ldd_violation_rate', 'avg_stability', 'avg_time',
-                          'avg_fleet_utilization', 'avg_volume_utilization']
-        ablation_summary = ablation_df.groupby('algorithm')[ablation_metrics].agg(['mean', 'std']).round(2)
-        ablation_summary.to_csv(os.path.join(summary_dir, 'ablation_summary.csv'))
-        print("  Generated: ablation_summary.csv")
-    
-    if not multicomp_df.empty:
-        multicomp_summary = multicomp_df[['multi_cost', 'single_cost', 'cost_improvement',
-                                         'multi_fleet', 'single_fleet', 'fleet_reduction',
-                                         'multi_util', 'single_util', 'util_improvement']].mean().round(2)
-        multicomp_summary.to_csv(os.path.join(summary_dir, 'multicomp_summary.csv'))
-        print("  Generated: multicomp_summary.csv")
-        
-        if 'n_compartments' in multicomp_df.columns:
-            comp_summary = multicomp_df.groupby('n_compartments').agg({
-                'cost_improvement': ['mean', 'std', 'count'],
-                'fleet_reduction': ['mean', 'std'],
-                'util_improvement': ['mean', 'std']
-            }).round(2)
-            comp_summary.to_csv(os.path.join(summary_dir, 'multicomp_compartment_summary.csv'))
-            print("  Generated: multicomp_compartment_summary.csv")
+    csv = os.path.join(output_dir, "ablation_study_results.csv")
+    if not os.path.exists(csv):
+        print(f"  Missing {csv}; skipping.")
+        return None
+    df = pd.read_csv(csv)
+    if df.empty or "avg_cost" not in df.columns:
+        return None
+    df["avg_cost"] = df["avg_cost"].replace([np.inf, -np.inf], np.nan)
+    pivot = df.pivot_table(index="instance", columns="algorithm",
+                           values="avg_cost", aggfunc="mean")
+    if "SA-ALNS" not in pivot.columns:
+        return None
+    rows = []
+    for algo in pivot.columns:
+        if algo == "SA-ALNS":
+            continue
+        pair = pivot[["SA-ALNS", algo]].dropna()
+        if len(pair) < 5:
+            continue
+        p = _wilcoxon_safe(pair["SA-ALNS"].values, pair[algo].values)
+        diff = pair["SA-ALNS"] - pair[algo]
+        rows.append({
+            "Variant": ABLATION_DISPLAY_NAMES.get(algo, algo),
+            "n_pairs": len(pair),
+            "SAALNS_mean": float(pair["SA-ALNS"].mean()),
+            "Variant_mean": float(pair[algo].mean()),
+            "Mean_delta": float(diff.mean()),
+            "Median_delta": float(diff.median()),
+            "Wilcoxon_p": p,
+            "SAALNS_wins": int((diff < 0).sum()),
+            "Variant_wins": int((diff > 0).sum()),
+            "Ties": int((np.abs(diff) < 1e-9).sum()),
+            "Significant_5pct": bool(np.isfinite(p) and p < 0.05),
+        })
+    if not rows:
+        return None
+    result = pd.DataFrame(rows).sort_values("Wilcoxon_p", na_position="last")
+    out = os.path.join(output_dir, "part4_statistics",
+                       "ablation_paired_tests.csv")
+    os.makedirs(os.path.dirname(out), exist_ok=True)
+    result.to_csv(out, index=False)
+    print(result.to_string(index=False))
+    print(f"  Wrote {out}")
+    return result
+
+
+def paired_multicomp_AB(output_dir):
+    print("\n" + "=" * 80)
+    print("PAIRED TEST: MULTICOMP A vs B (inf-filtered)")
+    print("=" * 80)
+    csv = os.path.join(output_dir, "part4_statistics", "multicomp_benefits.csv")
+    if not os.path.exists(csv):
+        print(f"  Missing {csv}; skipping.")
+        return None
+    df = pd.read_csv(csv)
+    if df.empty:
+        return None
+
+    results = []
+    for label, ca, cb in [("Cost", "A_full_cost", "B_nomix_cost"),
+                          ("Fleet", "A_full_fleet", "B_nomix_fleet")]:
+        if ca not in df.columns or cb not in df.columns:
+            continue
+        pair = df[[ca, cb]].replace([np.inf, -np.inf], np.nan).dropna()
+        if len(pair) < 5:
+            continue
+        p = _wilcoxon_safe(pair[ca].values, pair[cb].values)
+        diff = pair[ca] - pair[cb]
+        results.append({
+            "Metric": label, "n_pairs": len(pair),
+            "A_mean": float(pair[ca].mean()), "B_mean": float(pair[cb].mean()),
+            "Mean_delta": float(diff.mean()), "Median_delta": float(diff.median()),
+            "Wilcoxon_p": p,
+            "A_wins": int((diff < 0).sum()),
+            "B_wins": int((diff > 0).sum()),
+            "Ties": int((np.abs(diff) < 1e-9).sum()),
+            "Significant_5pct": bool(np.isfinite(p) and p < 0.05),
+        })
+    if not results:
+        return None
+    out_df = pd.DataFrame(results)
+    out_path = os.path.join(output_dir, "part4_statistics",
+                            "multicomp_paired_test_AB.csv")
+    out_df.to_csv(out_path, index=False)
+    print(out_df.to_string(index=False))
+    print(f"  Wrote {out_path}")
+    cost_row = next((r for r in results if r["Metric"] == "Cost"), None)
+    if cost_row and cost_row["A_mean"] > cost_row["B_mean"]:
+        print("\n  [VERDICT] On this benchmark, the FULL multi-compartment")
+        print("  model (A) does NOT beat the NO_MIX baseline (B) on cost.")
+        print("  The 'mixing benefit' claim is NOT supported by this data.")
+    return out_df
+
+
+# ============================================================================
+# FIGURES
+# ============================================================================
+
+def fig_sota_cost(df, output_dir):
+    fig, ax = plt.subplots(figsize=(12, 6))
+    for algo in df["algorithm"].unique():
+        sub = df[df["algorithm"] == algo]
+        if sub.empty:
+            continue
+        g = (sub.replace([np.inf, -np.inf], np.nan)
+             .groupby("n_customers")["avg_cost"]
+             .agg(["mean", "std"]).reset_index().dropna())
+        if g.empty:
+            continue
+        lw = 3 if algo == "SA-ALNS" else 2
+        ax.errorbar(g["n_customers"], g["mean"], yerr=g["std"].fillna(0),
+                    marker=MARKERS.get(algo, "o"),
+                    color=COLORS_SOTA.get(algo, "#333"),
+                    label=SOTA_DISPLAY_NAMES.get(algo, algo),
+                    markersize=8, capsize=3, linewidth=lw)
+    ax.set_xlabel("Number of Customers")
+    ax.set_ylabel("Average Penalised Cost ($)")
+    ax.set_title("SOTA Comparison: Penalised Cost vs Instance Size (finite runs)")
+    ax.legend(fontsize=8)
+    ax.grid(True, alpha=0.3, linestyle="--")
+    plt.tight_layout()
+    safe_savefig(fig, os.path.join(output_dir, "part1_sota", "Figure_1_Cost.pdf"))
+    plt.close(fig)
+
+
+def fig_sota_cg(df, output_dir):
+    fig, ax = plt.subplots(figsize=(12, 6))
+    for algo in df["algorithm"].unique():
+        sub = df[df["algorithm"] == algo]
+        if sub.empty:
+            continue
+        g = (sub.replace([np.inf, -np.inf], np.nan)
+             .groupby("n_customers")["avg_cg_compliance_rate"]
+             .mean().reset_index().dropna())
+        if g.empty:
+            continue
+        ax.plot(g["n_customers"], g["avg_cg_compliance_rate"], marker="o",
+                color=COLORS_SOTA.get(algo, "#333"),
+                label=SOTA_DISPLAY_NAMES.get(algo, algo), linewidth=2)
+    ax.set_xlabel("Number of Customers")
+    ax.set_ylabel("CG Compliance Rate (%)")
+    ax.set_title("CG Compliance vs Instance Size (over verified routes)")
+    ax.legend(fontsize=8)
+    ax.grid(True, alpha=0.3, linestyle="--")
+    plt.tight_layout()
+    safe_savefig(fig, os.path.join(output_dir, "part1_sota", "Figure_2_CG.pdf"))
+    plt.close(fig)
+
+
+def fig_sota_timing(df, output_dir):
+    fig, ax = plt.subplots(figsize=(12, 6))
+    for algo in df["algorithm"].unique():
+        sub = df[df["algorithm"] == algo]
+        if sub.empty:
+            continue
+        g = (sub.replace([np.inf, -np.inf], np.nan)
+             .groupby("n_customers")["avg_total_time"]
+             .mean().reset_index().dropna())
+        if g.empty:
+            continue
+        ax.plot(g["n_customers"], g["avg_total_time"],
+                marker="o", color=COLORS_SOTA.get(algo, "#333"),
+                label=SOTA_DISPLAY_NAMES.get(algo, algo), linewidth=2)
+    ax.set_xlabel("Number of Customers")
+    ax.set_ylabel("Wall-clock Time (s)")
+    ax.set_yscale("log")
+    ax.set_title("Wall-clock Time")
+    ax.legend(fontsize=8)
+    ax.grid(True, alpha=0.3, linestyle="--")
+    plt.tight_layout()
+    safe_savefig(fig, os.path.join(output_dir, "part1_sota", "Figure_3_Timing.pdf"))
+    plt.close(fig)
+
+
+def fig_sota_ldd(df, output_dir):
+    if df is None or df.empty:
+        return
+    fig, ax = plt.subplots(figsize=(12, 6))
+    for algo in df["algorithm"].unique():
+        sub = df[df["algorithm"] == algo]
+        if sub.empty:
+            continue
+        g = (sub.replace([np.inf, -np.inf], np.nan)
+             .groupby("n_customers")["avg_ldd_violation_rate"]
+             .agg(["mean", "std"]).reset_index().dropna())
+        if g.empty:
+            continue
+        lw = 3 if algo == "SA-ALNS" else 2
+        ax.errorbar(g["n_customers"], g["mean"], yerr=g["std"].fillna(0),
+                    marker=MARKERS.get(algo, "o"),
+                    color=COLORS_SOTA.get(algo, "#333"),
+                    label=SOTA_DISPLAY_NAMES.get(algo, algo),
+                    markersize=8, capsize=3, linewidth=lw)
+    ax.set_xlabel("Number of Customers")
+    ax.set_ylabel("LDD Violation Rate (%)")
+    ax.set_title("LDD Violation Rate vs. Instance Size")
+    ax.set_ylim(0, 105)
+    ax.legend(fontsize=8, loc="lower right")
+    ax.grid(True, alpha=0.3, linestyle="--")
+    plt.tight_layout()
+    safe_savefig(fig, os.path.join(output_dir, "part1_sota", "Figure_4_LDD.pdf"))
+    plt.close(fig)
+
+
+def fig_ablation_cost(df, output_dir):
+    fig, ax = plt.subplots(figsize=(12, 6))
+    df_clean = df.replace([np.inf, -np.inf], np.nan)
+    for algo in df["algorithm"].unique():
+        sub = df_clean[df_clean["algorithm"] == algo]
+        if sub.empty:
+            continue
+        g = sub.groupby("n_customers")["avg_cost"].agg(["mean", "std"]).reset_index().dropna()
+        if g.empty:
+            continue
+        lw = 3 if algo == "SA-ALNS" else 2
+        ax.errorbar(g["n_customers"], g["mean"], yerr=g["std"].fillna(0),
+                    marker=MARKERS.get(algo, "o"),
+                    color=COLORS_ABLATION.get(algo, "#333"),
+                    label=ABLATION_DISPLAY_NAMES.get(algo, algo),
+                    markersize=8, capsize=3, linewidth=lw)
+    ax.set_xlabel("Number of Customers")
+    ax.set_ylabel("Average Penalised Cost ($)")
+    ax.set_title("Ablation Study: Penalised Cost vs Instance Size (finite runs)")
+    ax.legend(fontsize=8)
+    ax.grid(True, alpha=0.3, linestyle="--")
+    plt.tight_layout()
+    safe_savefig(fig, os.path.join(output_dir, "part2_ablation",
+                                   "Figure_Ablation_Cost.pdf"))
+    plt.close(fig)
+
+
+def fig_ablation_safety(df, output_dir):
+    if df is None or df.empty:
+        return
+    fig, axes = plt.subplots(1, 3, figsize=(15, 5))
+    metrics = [("avg_cg_compliance_rate", "CG Compliance (%)", (0, 105)),
+               ("avg_ldd_violation_rate", "LDD Violation Rate (%)", (0, 105)),
+               ("avg_slosh_risk", "Slosh Risk Score", None)]
+    df_clean = df.replace([np.inf, -np.inf], np.nan)
+    for ax, (col, ylabel, ylim) in zip(axes, metrics):
+        if col not in df_clean.columns:
+            ax.set_visible(False)
+            continue
+        g = df_clean.groupby(["algorithm", "n_customers"])[col].mean().reset_index()
+        for algo in df_clean["algorithm"].unique():
+            sub = g[g["algorithm"] == algo]
+            if sub.empty:
+                continue
+            ax.plot(sub["n_customers"], sub[col],
+                    marker=MARKERS.get(algo, "o"),
+                    color=COLORS_ABLATION.get(algo, "#333"),
+                    label=ABLATION_DISPLAY_NAMES.get(algo, algo),
+                    linewidth=2)
+        ax.set_xlabel("Number of Customers")
+        ax.set_ylabel(ylabel)
+        if ylim:
+            ax.set_ylim(*ylim)
+        ax.grid(True, alpha=0.3, linestyle="--")
+    axes[0].legend(fontsize=7, loc="best")
+    fig.suptitle("Ablation Study: Safety Metrics", fontsize=12)
+    plt.tight_layout()
+    safe_savefig(fig, os.path.join(output_dir, "part2_ablation",
+                                   "Figure_Ablation_Safety.pdf"))
+    plt.close(fig)
+
+
+def fig_multicomp_AB(df, output_dir):
+    if df is None or df.empty:
+        return
+    fig, axes = plt.subplots(1, 3, figsize=(15, 5))
+    df_clean = df.replace([np.inf, -np.inf], np.nan)
+
+    gA = df_clean.groupby("n_customers")["A_full_cost"].mean()
+    gB = df_clean.groupby("n_customers")["B_nomix_cost"].mean()
+    axes[0].plot(gA.index, gA.values, marker="o", color="#2E86AB",
+                 label="A: FULL (mixing)", linewidth=2)
+    axes[0].plot(gB.index, gB.values, marker="s", color="#E76F51",
+                 label="B: NO_MIX", linewidth=2)
+    axes[0].set_xlabel("Number of Customers")
+    axes[0].set_ylabel("Mean Penalised Cost ($)")
+    axes[0].set_title("Cost: Mixing Benefit")
+    axes[0].legend(fontsize=8)
+    axes[0].grid(True, alpha=0.3, linestyle="--")
+
+    gA = df_clean.groupby("n_customers")["A_full_fleet"].mean()
+    gB = df_clean.groupby("n_customers")["B_nomix_fleet"].mean()
+    axes[1].plot(gA.index, gA.values, marker="o", color="#2E86AB",
+                 label="A: FULL", linewidth=2)
+    axes[1].plot(gB.index, gB.values, marker="s", color="#E76F51",
+                 label="B: NO_MIX", linewidth=2)
+    axes[1].set_xlabel("Number of Customers")
+    axes[1].set_ylabel("Mean Fleet Size")
+    axes[1].set_title("Fleet Size: Mixing Benefit")
+    axes[1].legend(fontsize=8)
+    axes[1].grid(True, alpha=0.3, linestyle="--")
+
+    data = df_clean["cost_improvement_AB"].dropna()
+    if len(data) > 0:
+        axes[2].hist(data, bins=15, color="#2E86AB", edgecolor="black", alpha=0.8)
+        axes[2].axvline(0, color="red", linestyle="--", linewidth=1.5,
+                        label="No benefit")
+        axes[2].axvline(data.mean(), color="black", linewidth=1.5,
+                        label=f"Mean = {data.mean():+.1f}%")
+        axes[2].set_xlabel("Cost Improvement A over B (%)")
+        axes[2].set_ylabel("Instances")
+        axes[2].set_title("Distribution of Mixing Benefit")
+        axes[2].legend(fontsize=8)
+        axes[2].grid(True, alpha=0.3, linestyle="--")
+
+    fig.suptitle("Multi-Compartment Mixing Benefit", fontsize=12)
+    plt.tight_layout()
+    safe_savefig(fig, os.path.join(output_dir, "part2_ablation",
+                                   "Figure_Multicomp_AB.pdf"))
+    plt.close(fig)
+
+
+def fig_multicomp_fleet_legacy(multicomp_df, output_dir):
+    if multicomp_df is None or multicomp_df.empty:
+        return
+    if "fleet_reduction_AB" not in multicomp_df.columns:
+        return
+    fig, ax = plt.subplots(figsize=(8, 5))
+    df_clean = multicomp_df.replace([np.inf, -np.inf], np.nan)
+    g = (df_clean.groupby("n_compartments")["fleet_reduction_AB"]
+         .agg(["mean", "std"]).reset_index().dropna())
+    if g.empty:
+        plt.close(fig)
+        return
+    ax.bar(g["n_compartments"].astype(str), g["mean"],
+           yerr=g["std"].fillna(0), capsize=4, color="#2E86AB", edgecolor="black")
+    ax.set_xlabel("Number of Compartments")
+    ax.set_ylabel("Fleet Reduction A over B (%)")
+    ax.set_title("Multi-Compartment Fleet Reduction (Option B1)")
+    ax.grid(True, axis="y", alpha=0.3, linestyle="--")
+    plt.tight_layout()
+    safe_savefig(fig, os.path.join(output_dir, "part2_ablation",
+                                   "Figure_Compartment_Fleet.pdf"))
+    plt.close(fig)
+
+
+def generate_all_figures(sota_df, ablation_df, multicomp_df, output_dir):
+    print("\nGENERATING FIGURES")
+    if sota_df is not None and not sota_df.empty:
+        for fn in (fig_sota_cost, fig_sota_cg, fig_sota_timing, fig_sota_ldd):
+            try:
+                fn(sota_df, output_dir)
+            except Exception as e:
+                print(f"  {fn.__name__} error: {e}")
+    if ablation_df is not None and not ablation_df.empty:
+        for fn in (fig_ablation_cost, fig_ablation_safety):
+            try:
+                fn(ablation_df, output_dir)
+            except Exception as e:
+                print(f"  {fn.__name__} error: {e}")
+    if multicomp_df is not None and not multicomp_df.empty:
+        for fn in (fig_multicomp_AB, fig_multicomp_fleet_legacy):
+            try:
+                fn(multicomp_df, output_dir)
+            except Exception as e:
+                print(f"  {fn.__name__} error: {e}")
+
+
+# ============================================================================
+# DIAGNOSTICS
+# ============================================================================
+
+def print_diagnostics(sota_df, saca):
+    print("\n" + "=" * 80)
+    print("DIAGNOSTICS")
+    print("=" * 80)
+    if sota_df is None or sota_df.empty:
+        print("No SOTA data.")
+        return
+    for algo in sota_df["algorithm"].unique():
+        sub = sota_df[sota_df["algorithm"] == algo]
+        if sub.empty:
+            continue
+        df_clean = sub.replace([np.inf, -np.inf], np.nan)
+        avg_n = sub["n_customers"].mean()
+        avg_fleet = df_clean["avg_fleet_size"].mean()
+        ratio = avg_fleet / avg_n if avg_n > 0 else 0
+        ff_rate = df_clean["feasibility_failure_rate"].mean() \
+            if "feasibility_failure_rate" in sub.columns else 0.0
+        avg_pen = df_clean["avg_penalty"].mean() if "avg_penalty" in sub.columns else 0.0
+        saca_hit = df_clean["avg_cache_hit_rate"].mean() \
+            if "avg_cache_hit_rate" in sub.columns else 0.0
+        route_hit = df_clean["avg_route_penalty_cache_hit_rate"].mean() \
+            if "avg_route_penalty_cache_hit_rate" in sub.columns else 0.0
+        milp_frac = df_clean["milp_time_fraction"].mean() \
+            if "milp_time_fraction" in sub.columns else 0.0
+        milp_calls = df_clean["avg_milp_calls"].mean() \
+            if "avg_milp_calls" in sub.columns else 0.0
+        infeas = df_clean["infeasibility_rate_pct"].mean() \
+            if "infeasibility_rate_pct" in sub.columns else 0.0
+        avg_cost = df_clean["avg_cost"].mean()
+        n_total = df_clean["avg_n_total_routes"].mean() \
+            if "avg_n_total_routes" in sub.columns else float("nan")
+        n_verif = df_clean["avg_n_verified_routes"].mean() \
+            if "avg_n_verified_routes" in sub.columns else float("nan")
+        print(f"\n{algo}")
+        print(f"  avg penalised cost: ${avg_cost:.2f} (finite runs)")
+        print(f"  run-infeasibility : {infeas:.1f}% of runs returned inf")
+        print(f"  avg fleet size    : {avg_fleet:.2f}   "
+              f"(fleet/customer = {ratio:.2f})")
+        print(f"  routes verified   : {n_verif:.2f} / {n_total:.2f} "
+              f"({100.0*n_verif/max(n_total,1e-9):.1f}%)")
+        print(f"  avg CG compliance : {df_clean['avg_cg_compliance_rate'].mean():.2f}% "
+              f"(over verified routes)")
+        print(f"  avg stability     : {df_clean['avg_stability'].mean():.2f}% "
+              f"(mean over verified routes)")
+        print(f"  avg LDD violation : {df_clean['avg_ldd_violation_rate'].mean():.2f}%")
+        if "avg_slosh_risk" in sub.columns:
+            print(f"  avg slosh penalty : {df_clean['avg_slosh_risk'].mean():.3f}")
+        print(f"  avg route penalty : {avg_pen:.3f}")
+        print(f"  hard-infeasible %: {ff_rate:.1f}% (during search)")
+        print(f"  route-penalty cache hit : {route_hit:.1f}%  "
+              f"(quote this in the manuscript)")
+        print(f"  SACA-level cache hit    : {saca_hit:.1f}%  "
+              f"(saturates at 100 because LP fallback is never called)")
+        print(f"  avg wall-clock    : {df_clean['avg_total_time'].mean():.4f}s")
+        print(f"  MILP fraction     : {milp_frac*100:.1f}%")
+        print(f"  avg MILP calls    : {milp_calls:.0f}")
+    print("\nFailure-reason breakdown (SACA diagnostic):")
+    total = sum(saca.failure_reasons.values())
+    if total == 0:
+        print("  (no failures recorded)")
+    else:
+        for reason, count in sorted(saca.failure_reasons.items(),
+                                    key=lambda kv: -kv[1]):
+            print(f"  {reason:22s}: {count:5d}  ({100.0*count/total:.1f}%)")
+
+
+def probe_saca_failure_reasons(rep_fp, n_probes=200):
+    inst = json.load(open(rep_fp))
+    veh = create_vehicle_from_instance(inst)
+    diag_saca = SACA(veh)
+    data = build_instance_data(inst)
+    n = len(inst["customers"])
+    for _ in range(n_probes):
+        k = random.randint(1, min(n, 9))
+        route = random.sample(range(n), k)
+        demands = {i: data["customers"][i]["demand"] for i in route}
+        calc_tmp = ObjectiveCalculator(data, veh, saca=diag_saca)
+        travel = calc_tmp.compute_transportation_cost({0: route})
+        diag_saca.verify_route(route, demands, transport_cost=travel)
+    return diag_saca
 
 
 # ============================================================================
@@ -4504,101 +3547,82 @@ def generate_summary_statistics(sota_df: pd.DataFrame, ablation_df: pd.DataFrame
 # ============================================================================
 
 def main():
+    parser = argparse.ArgumentParser(
+        description="Run the DSC-CTRP SA-ALNS experiments.")
+    parser.add_argument("--instances", default=DEFAULT_INSTANCE_DIR,
+                        help="Directory containing (or to receive) the JSON "
+                             "benchmark instances.")
+    parser.add_argument("--output", default=DEFAULT_OUTPUT_DIR,
+                        help="Directory in which to write results and figures.")
+    parser.add_argument("--max-instances", type=int, default=30,
+                        help="Number of instances to use for the SOTA and "
+                             "ablation runs (default: 30, as in the manuscript).")
+    args = parser.parse_args()
+
     print("=" * 80)
-    print("DSC-CTRP EXPERIMENTAL COMPARISON - FINAL VERSION WITH ALL METRICS")
+    print("DSC-CTRP v8.9.1 — SA-ALNS with deterministic seed")
     print("=" * 80)
-    print("\nALGORITHMS COMPARED:")
-    print("  1. IALNS (Proposed) - Adaptive weights + enhanced operators")
-    print("  2. Standard_ALNS - Standard ALNS baseline (no adaptive)")
-    print("  3. FDAHS - Feasibility-Driven Anytime Hybrid Search (2026)")
-    print("  4. GCOF - Guided Collaborative Optimization Framework (2026)")
-    print("  5. HSA - Hybrid Simulated Annealing (2023)")
-    print("  6. ACO_2opt - Ant Colony Optimization with 2-Opt (2015)")
-    print("\nABLATION VARIANTS (6 total):")
-    print("  1. IALNS (Full)")
-    print("  2. IALNS_NS (No Stability verification)")
-    print("  3. IALNS_NA (No Adaptive operator selection)")
-    print("  4. IALNS_SEQ (Sequential optimization)")
-    print("  5. IALNS_NC (No Cache)")
-    print("  6. IALNS_IMB (No Imbalance destroy operator)")
-    print("\nPERFORMANCE METRICS:")
-    print("  Economic Efficiency: Total Distance, Transportation Cost, Fleet Size,")
-    print("                      Fleet Utilization, Volume Utilization")
-    print("  Safety Compliance: LDD Violation Rate, Stability Margin,")
-    print("                     Minimum Load Ratio, Slosh Risk Score, CG Compliance")
-    print("  Computational: CPU Time, SACA Calls, Cache Hit Rate, Iterations to Convergence")
-    print("\nSENSITIVITY ANALYSIS:")
-    print("  λ_H (Handling Cost): 0.05, 0.075, 0.10, 0.125, 0.15 (Baseline: 0.10)")
-    print("  λ_W (Overload Penalty): 0.50, 0.75, 1.00, 1.25, 1.50 (Baseline: 1.00)")
-    print("  λ_S (Stability Penalty): 0.25, 0.375, 0.50, 0.625, 0.75 (Baseline: 0.50)")
-    print("\nBENCHMARK INSTANCES (281 total):")
-    print("  - Paixão Layer (40 instances): S_1--S_10 (3 customers, 1 comp),")
-    print("    M_1--M_10 (5 customers, 2 comp), L_1--L_10 (7 customers, 3 comp),")
-    print("    EL_1--EL_10 (9 customers, 4 comp)")
-    print("  - Mirzaei/Muyldermans Layer (241 instances): vrpnc1--vrpnc241 (10--100 customers)")
+    print("Reproducibility: seeds derived via SHA-1 (_stable_seed).")
+    print("Cache reporting: route-penalty hit rate is the manuscript figure;")
+    print("                 SACA-level hit rate saturates and is retained only")
+    print("                 for backward compatibility.")
+
+    os.makedirs(args.output, exist_ok=True)
+    for subdir in ("part1_sota", "part2_ablation", "part3_sensitivity",
+                   "part4_statistics"):
+        os.makedirs(os.path.join(args.output, subdir), exist_ok=True)
+
+    print(f"\nInstances: {args.instances}")
+    print(f"Output:    {args.output}")
+
+    ensure_instances(args.instances)
+
+    print("\n" + "=" * 80)
+    print("PART 1: SOTA COMPARISON")
     print("=" * 80)
-    
-    print(f"\nBenchmark Directory: {BASE_DIR}")
-    print(f"Output Directory: {OUTPUT_DIR}")
-    
-    if not os.path.exists(BASE_DIR):
-        print(f"\nWARNING: Benchmark directory not found: {BASE_DIR}")
-        print("Creating benchmark directory and generating all 281 instances...")
-        os.makedirs(BASE_DIR, exist_ok=True)
-        generate_benchmark_instances(BASE_DIR, num_instances=281)
+    sota = SOTAComparison(args.instances, args.output)
+    sota_df = sota.run_all_instances(max_instances=args.max_instances)
+
+    rep_fp = None
+    for root, _, fs in os.walk(args.instances):
+        for f in fs:
+            if f.endswith(".json"):
+                rep_fp = os.path.join(root, f)
+                break
+        if rep_fp:
+            break
+    if rep_fp:
+        diag_saca = probe_saca_failure_reasons(rep_fp, n_probes=200)
+        print_diagnostics(sota_df, diag_saca)
     else:
-        json_files = []
-        for root, dirs, files in os.walk(BASE_DIR):
-            for file in files:
-                if file.endswith('.json'):
-                    json_files.append(os.path.join(root, file))
-        if len(json_files) == 0:
-            print(f"\nWARNING: No JSON instance files found in: {BASE_DIR}")
-            print("Generating all 281 benchmark instances...")
-            generate_benchmark_instances(BASE_DIR, num_instances=281)
-        else:
-            print(f"\nFound {len(json_files)} JSON instance files")
-            if len(json_files) < 281:
-                print(f"Only {len(json_files)} instances found. Generating remaining instances...")
-                generate_benchmark_instances(BASE_DIR, num_instances=281)
-    
-    # PART 1: SOTA
+        print_diagnostics(sota_df, SACA(create_vehicle_from_instance(
+            generate_single_instance(20, "Paixao", 1))))
+
     print("\n" + "=" * 80)
-    print("PART 1: STATE-OF-THE-ART COMPARISON (6 Algorithms)")
+    print("PART 2: ABLATION STUDY")
     print("=" * 80)
-    sota_exp = SOTAComparison(BASE_DIR, OUTPUT_DIR)
-    sota_df = sota_exp.run_all_instances(max_instances=50)
-    
-    # PART 2: Ablation
-    print("\n" + "=" * 80)
-    print("PART 2: ABLATION STUDY (6 Variants)")
-    print("=" * 80)
-    ablation_exp = AblationComparison(BASE_DIR, OUTPUT_DIR)
-    ablation_df = ablation_exp.run_all_instances(max_instances=50)
-    
-    # PART 3: Sensitivity Analysis
+    abl = AblationComparison(args.instances, args.output)
+    ablation_df = abl.run_all_instances(max_instances=args.max_instances)
+
     print("\n" + "=" * 80)
     print("PART 3: SENSITIVITY ANALYSIS")
     print("=" * 80)
-    sensitivity_analyzer = SensitivityAnalyzer(BASE_DIR, OUTPUT_DIR)
-    sensitivity_df = sensitivity_analyzer.run_sensitivity_analysis(max_instances=10, num_runs=3)
-    
-    # PART 4: Multi-compartment comparison
-    multicomp_df = run_multicomp_comparison(sota_df, BASE_DIR, OUTPUT_DIR)
-    
-    # PART 5: Statistical Tests
-    if not sota_df.empty:
-        stats_results = run_statistical_tests(sota_df, OUTPUT_DIR)
-    
-    # PART 6: Generate All Figures
-    generate_all_figures(sota_df, ablation_df, multicomp_df, OUTPUT_DIR)
-    
-    # PART 7: Summary Statistics
-    generate_summary_statistics(sota_df, ablation_df, multicomp_df, OUTPUT_DIR)
-    
+    sens = SensitivityAnalyzer(args.instances, args.output)
+    sens.run_sensitivity_analysis(max_instances=5, num_runs=2)
+
+    multicomp_df = run_multicomp_comparison(sota_df, args.instances, args.output)
+
+    if sota_df is not None and not sota_df.empty:
+        run_statistical_tests(sota_df, args.output)
+
+    paired_ablation_tests(args.output)
+    paired_multicomp_AB(args.output)
+
+    generate_all_figures(sota_df, ablation_df, multicomp_df, args.output)
+
     print("\n" + "=" * 80)
-    print("EXPERIMENT COMPLETE!")
-    print(f"All outputs saved to: {OUTPUT_DIR}")
+    print("EXPERIMENT COMPLETE")
+    print(f"Outputs: {args.output}")
     print("=" * 80)
 
 
